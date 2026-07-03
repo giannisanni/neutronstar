@@ -25761,40 +25761,29 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                             boosted, routed);
                 }
                 /*
-                 * A cache at or below one token's routed working set (uniform
-                 * routed layers x experts used) forces mid-token eviction of
-                 * entries the in-flight command stream still needs.  Measured
-                 * on PRO IQ2: budgets <= the working set silently change the
-                 * streamed prefill logits and greedy output, so refuse them
-                 * instead of serving different numerics without warning.
+                 * Below one token's routed working set (uniform routed layers
+                 * x experts used) every token evicts entries it is about to
+                 * reuse, and prefill serves layer overflow through mapped
+                 * model views.  Output stays byte-identical at any budget
+                 * (the addr-table kernels read the same bytes either way);
+                 * only throughput collapses, so warn instead of refusing.
                  */
                 const uint64_t min_experts =
                     (uint64_t)(routed - boosted) * DS4_N_EXPERT_USED;
-                if (min_experts != 0 && e->ssd_streaming_cache_experts != 0) {
-                    if (e->ssd_streaming_cache_experts <= min_experts) {
-                        fprintf(stderr,
-                                "ds4: SSD streaming expert cache of %u experts is at or below "
-                                "the per-token routed working set (%u layers x %u experts = "
-                                "%llu); this regime produces silently different outputs. "
-                                "Use at least %.2f GiB (--ssd-streaming-cache-experts)\n",
-                                e->ssd_streaming_cache_experts,
-                                routed - boosted,
-                                DS4_N_EXPERT_USED,
-                                (unsigned long long)min_experts,
-                                (double)((min_experts + 1u) * slab_expert_bytes) /
-                                    1073741824.0);
-                        ds4_engine_close(e);
-                        *out = NULL;
-                        return 1;
-                    }
-                    if (e->ssd_streaming_cache_experts < 2u * min_experts) {
-                        fprintf(stderr,
-                                "ds4: WARNING: SSD streaming expert cache (%u experts) is "
-                                "under twice the per-token routed working set (%llu); "
-                                "expect heavy thrashing\n",
-                                e->ssd_streaming_cache_experts,
-                                (unsigned long long)min_experts);
-                    }
+                if (min_experts != 0 &&
+                    e->ssd_streaming_cache_experts != 0 &&
+                    e->ssd_streaming_cache_experts < 2u * min_experts) {
+                    fprintf(stderr,
+                            "ds4: WARNING: SSD streaming expert cache (%u experts) is "
+                            "under twice the per-token routed working set (%u layers "
+                            "x %u experts = %llu); expect heavy thrashing below "
+                            "%.2f GiB\n",
+                            e->ssd_streaming_cache_experts,
+                            routed - boosted,
+                            DS4_N_EXPERT_USED,
+                            (unsigned long long)min_experts,
+                            (double)(2u * min_experts * slab_expert_bytes) /
+                                1073741824.0);
                 }
             }
         }
