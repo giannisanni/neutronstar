@@ -12807,7 +12807,8 @@ static int routed_moe_launch(
         float clamp,
         const ds4_gpu_tensor *x,
         uint32_t layer_index,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        bool force_resident) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -12833,6 +12834,7 @@ static int routed_moe_launch(
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
     const int use_stream_selected_cache =
+        !force_resident &&
         g_ssd_streaming_mode &&
         g_stream_selected_cache.valid &&
         g_stream_selected_cache.model_map == model_map &&
@@ -13491,7 +13493,7 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected,
     return 1;
 }
 
-extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
+extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, bool force_resident) {
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
@@ -13499,7 +13501,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, 1);
+                             layer_index, 1, force_resident);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
@@ -13510,7 +13512,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens);
+                             layer_index, n_tokens, false);
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
@@ -13828,3 +13830,106 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
            ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
 }
+
+/* --- GLM CUDA port: q8_0 token embedding lookups ------------------------- */
+
+__global__ static void embed_token_q8_0_kernel(
+        float *out,
+        const unsigned char *w,   /* q8_0 row base for the token */
+        uint32_t n_embd) {
+    uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_embd) return;
+    const uint32_t blk = e >> 5;          /* 32 elements per q8_0 block */
+    const uint32_t idx = e & 31u;
+    const unsigned char *b = w + (uint64_t)blk * 34u;
+    const float d = __half2float(*reinterpret_cast<const __half *>(b));
+    out[e] = d * (float)((const signed char *)(b + 2))[idx];
+}
+
+__global__ static void embed_tokens_q8_0_kernel(
+        float *out,
+        const int32_t *tokens,
+        const unsigned char *w,   /* q8_0 embedding table base */
+        uint32_t n_vocab,
+        uint32_t n_tokens,
+        uint32_t n_embd,
+        uint64_t row_bytes) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (gid >= n) return;
+    const uint32_t e = (uint32_t)(gid % n_embd);
+    const uint32_t t = (uint32_t)(gid / n_embd);
+    int32_t tok_i = tokens[t];
+    uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
+    if (tok >= n_vocab) tok = 0;
+    const unsigned char *row = w + (uint64_t)tok * row_bytes;
+    const uint32_t blk = e >> 5;
+    const uint32_t idx = e & 31u;
+    const unsigned char *b = row + (uint64_t)blk * 34u;
+    const float d = __half2float(*reinterpret_cast<const __half *>(b));
+    out[gid] = d * (float)((const signed char *)(b + 2))[idx];
+}
+
+extern "C" int ds4_gpu_embed_token_q8_0_tensor(
+        ds4_gpu_tensor *out,
+        const void       *model_map,
+        uint64_t          model_size,
+        uint64_t          weight_offset,
+        uint32_t          n_vocab,
+        uint32_t          token,
+        uint32_t          n_embd) {
+    if (!out || !model_map || n_embd == 0 || (n_embd & 31u) != 0) return 0;
+    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    const uint64_t table_bytes = (uint64_t)n_vocab * row_bytes;
+    if (weight_offset > model_size || table_bytes > model_size - weight_offset ||
+        out->bytes < (uint64_t)n_embd * sizeof(float)) {
+        return 0;
+    }
+    if (token >= n_vocab) token = 0;
+    const char *wptr = cuda_model_range_ptr(model_map,
+                                            weight_offset + (uint64_t)token * row_bytes,
+                                            row_bytes,
+                                            "glm token_embd row");
+    if (!wptr) return 0;
+    embed_token_q8_0_kernel<<<(n_embd + 255) / 256, 256>>>(
+        (float *)out->ptr, (const unsigned char *)wptr, n_embd);
+    return cuda_ok(cudaGetLastError(), "glm embed token q8_0 launch");
+}
+
+extern "C" int ds4_gpu_embed_tokens_q8_0_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *tokens,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n_vocab,
+        uint32_t                n_tokens,
+        uint32_t                n_embd) {
+    if (!out || !tokens || !model_map || n_embd == 0 || (n_embd & 31u) != 0 ||
+        n_tokens == 0) {
+        return 0;
+    }
+    const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
+    const uint64_t table_bytes = (uint64_t)n_vocab * row_bytes;
+    if (weight_offset > model_size || table_bytes > model_size - weight_offset ||
+        tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+        out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float)) {
+        return 0;
+    }
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset,
+                                            table_bytes, "glm token_embd");
+    if (!wptr) return 0;
+    const uint64_t n = (uint64_t)n_tokens * n_embd;
+    embed_tokens_q8_0_kernel<<<(uint32_t)((n + 255) / 256), 256>>>(
+        (float *)out->ptr,
+        (const int32_t *)tokens->ptr,
+        (const unsigned char *)wptr,
+        n_vocab, n_tokens, n_embd, row_bytes);
+    return cuda_ok(cudaGetLastError(), "glm embed tokens q8_0 launch");
+}
+
+#include "ds4_cuda_glm_kv.inc"
+#include "ds4_cuda_glm_indexer.inc"
+#include "ds4_cuda_glm_attn.inc"
+#include "ds4_cuda_glm_moe.inc"
+#include "ds4_cuda_glm_stubs.inc"

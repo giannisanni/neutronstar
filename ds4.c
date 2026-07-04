@@ -26915,11 +26915,15 @@ static bool glm_graph_down_type_supported(uint32_t down_type) {
 
 static bool glm_graph_layer_uses_generic_routed_moe(
         const ds4_layer_weights *l) {
+    /* The generic (DeepSeek) routed-MoE kernel only supports the IQ2_XXS gate +
+     * Q2_K down quant combo. GLM UD quants keep the down projection in IQ2_XXS,
+     * which that kernel rejects, so route those layers to the GLM MoE path. */
     return l &&
            l->ffn_gate_exps &&
            l->ffn_up_exps &&
            l->ffn_down_exps &&
-           l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS;
+           l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+           l->ffn_down_exps->type == DS4_TENSOR_Q2_K;
 }
 
 static bool glm_graph_stream_map_token(
@@ -38721,7 +38725,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = e;
             return 0;
         }
-        if (e->backend != DS4_BACKEND_METAL || !ds4_backend_uses_graph(e->backend)) {
+        /* Experimental CUDA port in progress: DS4_GLM_CUDA_UNSAFE=1 lets the
+         * CUDA backend attempt GLM; unimplemented kernels fail with clear
+         * one-time stderr notices instead of silently wrong output. */
+        if ((e->backend != DS4_BACKEND_METAL &&
+             !(e->backend == DS4_BACKEND_CUDA &&
+               getenv("DS4_GLM_CUDA_UNSAFE") != NULL)) ||
+            !ds4_backend_uses_graph(e->backend)) {
             fprintf(stderr,
                     "ds4: GLM 5.2 tensor layout is recognized, but GLM inference is "
                     "currently Metal-only; use --inspect, --cpu --first-token-test, "
