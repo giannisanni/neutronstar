@@ -18,6 +18,25 @@
 #include <unordered_map>
 #include <vector>
 
+/* CUDA < 12.2 lacks the cudaMemLocation overloads of cudaMemAdvise() and
+ * cudaMemPrefetchAsync(). Forward to the legacy int-device signatures. */
+#if CUDART_VERSION < 12020
+static inline cudaError_t cudaMemAdvise(const void *ptr, size_t count,
+                                        cudaMemoryAdvise advice,
+                                        cudaMemLocation loc) {
+    int dev = loc.type == cudaMemLocationTypeDevice ? loc.id : cudaCpuDeviceId;
+    return cudaMemAdvise(ptr, count, advice, dev);
+}
+static inline cudaError_t cudaMemPrefetchAsync(const void *ptr, size_t count,
+                                               cudaMemLocation loc,
+                                               unsigned int flags,
+                                               cudaStream_t stream) {
+    (void)flags;
+    int dev = loc.type == cudaMemLocationTypeDevice ? loc.id : cudaCpuDeviceId;
+    return cudaMemPrefetchAsync(ptr, count, dev, stream);
+}
+#endif
+
 #include "ds4_gpu.h"
 
 #ifndef M_PI
@@ -2149,6 +2168,404 @@ static int cuda_stream_layer_expert_ranges_valid(
     return 1;
 }
 
+/* Host expert read cache.  The Linux path reads experts with O_DIRECT, so
+ * the kernel page cache never retains them and every re-fetch of the same
+ * routed expert pays full disk latency.  This optional cache keeps recently
+ * read small ranges (routed experts are ~MiB-sized) in host memory, keyed by
+ * file range.  16-way set-associative, LRU within the set.
+ * Enable with DS4_CUDA_HOST_EXPERT_CACHE_GB=N (default: off).
+ * ponytail: pageable malloc buffers, not pinned; upload from pageable is
+ * slower but allocation is cheap and it is still >4x faster than the disk.
+ * Single-threaded like the rest of the streaming globals. */
+#define CUDA_HOST_CACHE_WAYS 16u
+#define CUDA_HOST_CACHE_MAX_ENTRY (64ull << 20)
+
+typedef struct {
+    uint64_t offset;
+    uint64_t bytes;
+    uint64_t age;
+    void *buf;
+    int valid;
+} cuda_host_cache_slot;
+
+static cuda_host_cache_slot *g_host_cache_slots;
+static uint32_t g_host_cache_nslots;
+static uint64_t g_host_cache_budget;
+static uint64_t g_host_cache_used;
+static uint64_t g_host_cache_tick;
+static uint64_t g_host_cache_hits;
+static uint64_t g_host_cache_misses;
+static int g_host_cache_checked;
+
+static void cuda_host_cache_init(void) {
+    if (g_host_cache_checked) return;
+    g_host_cache_checked = 1;
+    const char *env = getenv("DS4_CUDA_HOST_EXPERT_CACHE_GB");
+    if (!env || !env[0]) return;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long gb = strtoull(env, &end, 10);
+    if (end == env || errno != 0 || gb == 0) return;
+    uint64_t budget = (uint64_t)gb << 30;
+    uint64_t n = budget / (1ull << 20);
+    if (n < CUDA_HOST_CACHE_WAYS) n = CUDA_HOST_CACHE_WAYS;
+    if (n > 262144) n = 262144;
+    g_host_cache_slots =
+        (cuda_host_cache_slot *)calloc((size_t)n, sizeof(cuda_host_cache_slot));
+    if (!g_host_cache_slots) return;
+    g_host_cache_nslots = (uint32_t)n;
+    g_host_cache_budget = budget;
+    fprintf(stderr,
+            "ds4: CUDA host expert cache enabled: %llu GiB budget, %u slots\n",
+            gb, g_host_cache_nslots);
+}
+
+static uint32_t cuda_host_cache_bucket(uint64_t offset) {
+    offset ^= offset >> 33;
+    offset *= 0xff51afd7ed558ccdull;
+    offset ^= offset >> 33;
+    return (uint32_t)(offset % g_host_cache_nslots);
+}
+
+static void cuda_host_cache_report(void) {
+    const uint64_t total = g_host_cache_hits + g_host_cache_misses;
+    if (total != 0 && total % 2048 == 0) {
+        fprintf(stderr,
+                "ds4: CUDA host expert cache: %.1f%% hit rate (%llu lookups, %.2f GiB resident)\n",
+                100.0 * (double)g_host_cache_hits / (double)total,
+                (unsigned long long)total,
+                (double)g_host_cache_used / 1073741824.0);
+    }
+}
+
+static const void *cuda_host_cache_get(uint64_t offset, uint64_t bytes) {
+    if (g_host_cache_nslots == 0) return NULL;
+    const uint32_t h = cuda_host_cache_bucket(offset);
+    for (uint32_t i = 0; i < CUDA_HOST_CACHE_WAYS; i++) {
+        cuda_host_cache_slot *s =
+            &g_host_cache_slots[(h + i) % g_host_cache_nslots];
+        if (s->valid && s->offset == offset && s->bytes == bytes) {
+            s->age = ++g_host_cache_tick;
+            g_host_cache_hits++;
+            cuda_host_cache_report();
+            return s->buf;
+        }
+    }
+    g_host_cache_misses++;
+    cuda_host_cache_report();
+    return NULL;
+}
+
+/* Takes ownership of buf (malloc'd, bytes long); frees it if not inserted. */
+static void cuda_host_cache_insert_owned(uint64_t offset,
+                                         uint64_t bytes,
+                                         void *buf) {
+    if (g_host_cache_nslots == 0 || !buf) {
+        free(buf);
+        return;
+    }
+    const uint32_t h = cuda_host_cache_bucket(offset);
+    cuda_host_cache_slot *victim = NULL;   /* empty slot if available */
+    cuda_host_cache_slot *lru = NULL;      /* oldest valid entry in window */
+    for (uint32_t i = 0; i < CUDA_HOST_CACHE_WAYS; i++) {
+        cuda_host_cache_slot *s =
+            &g_host_cache_slots[(h + i) % g_host_cache_nslots];
+        if (!s->valid) {
+            if (!victim) victim = s;
+            continue;
+        }
+        if (s->offset == offset && s->bytes == bytes) {
+            free(buf); /* raced with an earlier insert of the same range */
+            return;
+        }
+        if (!lru || s->age < lru->age) lru = s;
+    }
+    /* Under budget pressure, replace the window's LRU even when an empty
+     * slot exists: with large entries the budget fills long before the
+     * table does, and refusing inserts would freeze the cache contents. */
+    if (g_host_cache_used + bytes > g_host_cache_budget && lru) {
+        victim = lru;
+    } else if (!victim) {
+        victim = lru;
+    }
+    if (!victim) {
+        free(buf);
+        return;
+    }
+    if (victim->valid) {
+        g_host_cache_used -= victim->bytes;
+        free(victim->buf);
+        victim->valid = 0;
+        victim->buf = NULL;
+    }
+    if (g_host_cache_used + bytes > g_host_cache_budget) {
+        free(buf); /* window had nothing to reclaim */
+        return;
+    }
+    victim->offset = offset;
+    victim->bytes = bytes;
+    victim->age = ++g_host_cache_tick;
+    victim->buf = buf;
+    victim->valid = 1;
+    g_host_cache_used += bytes;
+}
+
+/* Parallel expert fetch.  The selected-expert loader issues up to
+ * 3*n_experts serial read+upload+sync round trips per layer; on NVMe the
+ * drive sits idle between them.  This batches the direct loads of one layer:
+ * host-cache hits upload immediately, misses are read by a small pread()
+ * thread pool on the buffered fd, then all uploads share one stream sync.
+ * Completed read buffers are donated to the host expert cache (no extra
+ * copy).  Enable with DS4_CUDA_PARALLEL_FETCH_THREADS=N (default: off).
+ * ponytail: one-shot pthreads per layer batch and pageable upload buffers;
+ * persistent pool + pinned ring if profiling ever shows they matter. */
+typedef struct {
+    char *dst;
+    uint64_t offset;
+    uint64_t bytes;
+    void *host_buf;
+    int need_disk;
+    int ok;
+    int fd;                 /* source fd: model or bundle */
+    /* bundle jobs carry one contiguous expert and fan out to 3 dsts */
+    char *dst_up;
+    char *dst_down;
+    uint64_t part_gate;
+    uint64_t part_down;
+} cuda_fetch_job;
+
+typedef struct {
+    cuda_fetch_job *jobs;
+    uint32_t njobs;
+    volatile uint32_t next;
+} cuda_fetch_pool;
+
+/* Expert bundle sidecar (CUDA port of the idea in upstream issue #491).
+ * Optional derived file where each routed expert's gate+up+down tensors are
+ * contiguous, so an expert miss is ONE pread instead of three scattered
+ * ones. Set DS4_CUDA_EXPERT_BUNDLE=/path/to/file. Only used by the parallel
+ * fetch path (DS4_CUDA_PARALLEL_FETCH_THREADS >= 1). */
+#define CUDA_BUNDLE_CACHE_KEY_BIT (1ull << 63)
+
+typedef struct {
+    uint32_t layer;
+    uint32_t n_experts;
+    uint64_t gate_bytes;
+    uint64_t down_bytes;
+    uint64_t base;
+} cuda_bundle_layer;
+
+static int g_bundle_fd = -1;
+static cuda_bundle_layer *g_bundle_layers;
+static uint32_t g_bundle_nlayers;
+static int g_bundle_checked;
+
+static void cuda_bundle_init(void) {
+    if (g_bundle_checked) return;
+    g_bundle_checked = 1;
+    const char *path = getenv("DS4_CUDA_EXPERT_BUNDLE");
+    if (!path || !path[0]) return;
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: CUDA expert bundle open failed: %s\n", strerror(errno));
+        return;
+    }
+    char magic[8];
+    uint32_t n = 0;
+    if (pread(fd, magic, 8, 0) != 8 || memcmp(magic, "DS4BNDL1", 8) != 0 ||
+        pread(fd, &n, 4, 8) != 4 || n == 0 || n > 512) {
+        fprintf(stderr, "ds4: CUDA expert bundle header invalid, ignoring\n");
+        close(fd);
+        return;
+    }
+    cuda_bundle_layer *ls =
+        (cuda_bundle_layer *)calloc((size_t)n, sizeof(cuda_bundle_layer));
+    if (!ls) {
+        close(fd);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        unsigned char rec[32];
+        if (pread(fd, rec, 32, 12 + (uint64_t)i * 32) != 32) {
+            fprintf(stderr, "ds4: CUDA expert bundle truncated header, ignoring\n");
+            free(ls);
+            close(fd);
+            return;
+        }
+        memcpy(&ls[i].layer, rec, 4);
+        memcpy(&ls[i].n_experts, rec + 4, 4);
+        memcpy(&ls[i].gate_bytes, rec + 8, 8);
+        memcpy(&ls[i].down_bytes, rec + 16, 8);
+        memcpy(&ls[i].base, rec + 24, 8);
+    }
+    g_bundle_fd = fd;
+    g_bundle_layers = ls;
+    g_bundle_nlayers = n;
+    fprintf(stderr, "ds4: CUDA expert bundle enabled: %s (%u layers)\n", path, n);
+}
+
+static const cuda_bundle_layer *cuda_bundle_layer_get(uint32_t layer,
+                                                      uint64_t gate_expert_bytes,
+                                                      uint64_t down_expert_bytes) {
+    if (g_bundle_fd < 0) return NULL;
+    for (uint32_t i = 0; i < g_bundle_nlayers; i++) {
+        if (g_bundle_layers[i].layer == layer &&
+            g_bundle_layers[i].gate_bytes == gate_expert_bytes &&
+            g_bundle_layers[i].down_bytes == down_expert_bytes) {
+            return &g_bundle_layers[i];
+        }
+    }
+    return NULL;
+}
+
+static int cuda_parallel_fetch_threads(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    cached = 0;
+    const char *env = getenv("DS4_CUDA_PARALLEL_FETCH_THREADS");
+    if (env && env[0]) {
+        int v = atoi(env);
+        if (v > 0) cached = v > 16 ? 16 : v;
+    }
+    return cached;
+}
+
+static void *cuda_fetch_worker(void *arg) {
+    cuda_fetch_pool *p = (cuda_fetch_pool *)arg;
+    for (;;) {
+        const uint32_t j = __sync_fetch_and_add(&p->next, 1u);
+        if (j >= p->njobs) return NULL;
+        cuda_fetch_job *job = &p->jobs[j];
+        if (!job->need_disk) continue;
+        job->host_buf = malloc((size_t)job->bytes);
+        if (!job->host_buf) continue;
+        uint64_t done = 0;
+        while (done < job->bytes) {
+            const ssize_t r = pread(job->fd,
+                                    (char *)job->host_buf + done,
+                                    (size_t)(job->bytes - done),
+                                    (off_t)(job->offset + done));
+            if (r <= 0) break;
+            done += (uint64_t)r;
+        }
+        if (done == job->bytes) {
+            job->ok = 1;
+        } else {
+            free(job->host_buf);
+            job->host_buf = NULL;
+        }
+    }
+}
+
+static uint64_t cuda_fetch_cache_key(const cuda_fetch_job *job) {
+    return job->fd == g_bundle_fd ? (job->offset | CUDA_BUNDLE_CACHE_KEY_BIT)
+                                  : job->offset;
+}
+
+/* Upload a job's payload to its device destination(s) on the shared stream.
+ * Bundle jobs fan one contiguous expert out to gate/up/down. */
+static int cuda_fetch_upload(const cuda_fetch_job *job, const void *payload) {
+    const char *src = (const char *)payload;
+    if (!job->dst_up) {
+        return cuda_ok(cudaMemcpyAsync(job->dst, src, (size_t)job->bytes,
+                                       cudaMemcpyHostToDevice,
+                                       g_stream_selected_upload_stream),
+                       "parallel fetch upload");
+    }
+    return cuda_ok(cudaMemcpyAsync(job->dst, src, (size_t)job->part_gate,
+                                   cudaMemcpyHostToDevice,
+                                   g_stream_selected_upload_stream),
+                   "bundle gate upload") &&
+           cuda_ok(cudaMemcpyAsync(job->dst_up, src + job->part_gate,
+                                   (size_t)job->part_gate,
+                                   cudaMemcpyHostToDevice,
+                                   g_stream_selected_upload_stream),
+                   "bundle up upload") &&
+           cuda_ok(cudaMemcpyAsync(job->dst_down, src + 2 * job->part_gate,
+                                   (size_t)job->part_down,
+                                   cudaMemcpyHostToDevice,
+                                   g_stream_selected_upload_stream),
+                   "bundle down upload");
+}
+
+/* Runs a batch of expert fetch jobs. Returns 1 on success. Buffers of
+ * successful disk reads are donated to the host expert cache. */
+static int cuda_fetch_execute(cuda_fetch_job *jobs, uint32_t njobs) {
+    if (njobs == 0) return 1;
+    if (!g_stream_selected_upload_stream) {
+        if (!cuda_ok(cudaStreamCreateWithFlags(&g_stream_selected_upload_stream,
+                                               cudaStreamNonBlocking),
+                     "parallel fetch stream creation")) {
+            return 0;
+        }
+    }
+    cuda_host_cache_init();
+
+    uint32_t disk_jobs = 0;
+    for (uint32_t i = 0; i < njobs; i++) {
+        cuda_fetch_job *job = &jobs[i];
+        const void *cached = cuda_host_cache_get(cuda_fetch_cache_key(job),
+                                                 job->bytes);
+        if (cached) {
+            if (!cuda_fetch_upload(job, cached)) return 0;
+            job->ok = 1;
+        } else {
+            job->need_disk = 1;
+            disk_jobs++;
+        }
+    }
+
+    if (disk_jobs != 0) {
+        cuda_fetch_pool pool;
+        pool.jobs = jobs;
+        pool.njobs = njobs;
+        pool.next = 0;
+        int nthreads = cuda_parallel_fetch_threads();
+        if ((uint32_t)nthreads > disk_jobs) nthreads = (int)disk_jobs;
+        pthread_t tids[16];
+        int spawned = 0;
+        for (int t = 0; t < nthreads; t++) {
+            if (pthread_create(&tids[t], NULL, cuda_fetch_worker, &pool) != 0) break;
+            spawned++;
+        }
+        if (spawned == 0) cuda_fetch_worker(&pool); /* degraded: run inline */
+        for (int t = 0; t < spawned; t++) pthread_join(tids[t], NULL);
+
+        for (uint32_t i = 0; i < njobs; i++) {
+            cuda_fetch_job *job = &jobs[i];
+            if (!job->need_disk) continue;
+            if (!job->ok) {
+                fprintf(stderr,
+                        "ds4: CUDA parallel expert fetch read failed at offset %.2f GiB\n",
+                        (double)job->offset / 1073741824.0);
+                goto fail;
+            }
+            if (!cuda_fetch_upload(job, job->host_buf)) goto fail;
+        }
+    }
+
+    if (!cuda_ok(cudaStreamSynchronize(g_stream_selected_upload_stream),
+                 "parallel fetch sync")) {
+        goto fail;
+    }
+    for (uint32_t i = 0; i < njobs; i++) {
+        if (jobs[i].need_disk && jobs[i].ok && jobs[i].host_buf) {
+            cuda_host_cache_insert_owned(cuda_fetch_cache_key(&jobs[i]),
+                                         jobs[i].bytes, jobs[i].host_buf);
+            jobs[i].host_buf = NULL;
+        }
+    }
+    return 1;
+
+fail:
+    (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+    for (uint32_t i = 0; i < njobs; i++) {
+        free(jobs[i].host_buf);
+        jobs[i].host_buf = NULL;
+    }
+    return 0;
+}
+
 static int cuda_model_copy_to_device_streamed(
         char *dst,
         const void *model_map,
@@ -2169,9 +2586,26 @@ static int cuda_model_copy_to_device_streamed(
                        what ? what : "stream selected expert copy");
     }
 
+    cuda_host_cache_init();
+    if (bytes <= CUDA_HOST_CACHE_MAX_ENTRY) {
+        const void *cached = cuda_host_cache_get(offset, bytes);
+        if (cached) {
+            return cuda_ok(cudaMemcpy(dst, cached, (size_t)bytes,
+                                      cudaMemcpyHostToDevice),
+                           what ? what : "host cache expert copy");
+        }
+    }
+    char *capture = NULL;
+    if (g_host_cache_nslots != 0 && bytes <= CUDA_HOST_CACHE_MAX_ENTRY) {
+        capture = (char *)malloc((size_t)bytes); /* NULL is fine: skip caching */
+    }
+
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
     const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) return 0;
+    if (!cuda_stream_selected_stage_pool_alloc(stage_bytes)) {
+        free(capture);
+        return 0;
+    }
 
     cudaError_t err = cudaSuccess;
     uint64_t copied = 0;
@@ -2187,6 +2621,7 @@ static int cuda_model_copy_to_device_streamed(
                         what ? what : "expert",
                         cudaGetErrorString(err));
                 (void)cudaGetLastError();
+                free(capture);
                 return 0;
             }
         }
@@ -2202,8 +2637,10 @@ static int cuda_model_copy_to_device_streamed(
                     what ? what : "expert",
                     (double)copied / 1048576.0,
                     strerror(errno));
+            free(capture);
             return 0;
         }
+        if (capture) memcpy(capture + copied, payload, (size_t)n);
         err = cudaMemcpyAsync(dst + copied,
                               payload,
                               (size_t)n,
@@ -2216,6 +2653,7 @@ static int cuda_model_copy_to_device_streamed(
                     (double)copied / 1048576.0,
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
+            free(capture);
             return 0;
         }
         err = cudaEventRecord(g_stream_selected_stage_event[bi],
@@ -2226,6 +2664,7 @@ static int cuda_model_copy_to_device_streamed(
                     what ? what : "expert",
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
+            free(capture);
             return 0;
         }
         cuda_model_drop_file_pages(offset + copied, n);
@@ -2241,8 +2680,10 @@ static int cuda_model_copy_to_device_streamed(
                 what ? what : "expert",
                 cudaGetErrorString(err));
         (void)cudaGetLastError();
+        free(capture);
         return 0;
     }
+    if (capture) cuda_host_cache_insert_owned(offset, bytes, capture);
     return 1;
 }
 
@@ -2972,6 +3413,22 @@ static int cuda_stream_selected_cache_begin_compact_load(
     uint32_t cache_misses = 0;
     uint32_t direct_loads = 0;
 
+    cuda_fetch_job *fetch_jobs = NULL;
+    uint32_t fetch_njobs = 0;
+    const int parallel_fetch =
+        cuda_parallel_fetch_threads() > 0 &&
+        g_model_fd >= 0 &&
+        (g_model_fd_host_base == NULL || model_map == g_model_fd_host_base);
+    if (parallel_fetch && compact_count != 0) {
+        fetch_jobs = (cuda_fetch_job *)calloc((size_t)compact_count * 3u,
+                                              sizeof(cuda_fetch_job));
+        /* NULL is fine: falls back to the serial path below */
+    }
+    cuda_bundle_init();
+    const cuda_bundle_layer *bundle = fetch_jobs != NULL ?
+        cuda_bundle_layer_get(layer, gate_expert_bytes, down_expert_bytes) :
+        NULL;
+
     for (uint32_t i = 0; i < compact_count; i++) {
         if (compact_ids[i] < 0 || (uint32_t)compact_ids[i] >= n_total_expert) {
             fprintf(stderr,
@@ -3053,7 +3510,35 @@ static int cuda_stream_selected_cache_begin_compact_load(
             const uint64_t up_src = up_offset + expert * gate_expert_bytes;
             const uint64_t down_src = down_offset + expert * down_expert_bytes;
             direct_loads++;
-            if (!cuda_model_copy_to_device_streamed(g_stream_selected_cache.gate_ptr + gate_dst,
+            if (fetch_jobs && bundle && expert < bundle->n_experts) {
+                cuda_fetch_job *j = &fetch_jobs[fetch_njobs];
+                const uint64_t per =
+                    2 * bundle->gate_bytes + bundle->down_bytes;
+                j[0].dst = g_stream_selected_cache.gate_ptr + gate_dst;
+                j[0].dst_up = g_stream_selected_cache.up_ptr + gate_dst;
+                j[0].dst_down = g_stream_selected_cache.down_ptr + down_dst;
+                j[0].part_gate = bundle->gate_bytes;
+                j[0].part_down = bundle->down_bytes;
+                j[0].offset = bundle->base + expert * per;
+                j[0].bytes = per;
+                j[0].fd = g_bundle_fd;
+                fetch_njobs += 1;
+            } else if (fetch_jobs) {
+                cuda_fetch_job *j = &fetch_jobs[fetch_njobs];
+                j[0].dst = g_stream_selected_cache.gate_ptr + gate_dst;
+                j[0].offset = gate_src;
+                j[0].bytes = gate_expert_bytes;
+                j[0].fd = g_model_fd;
+                j[1].dst = g_stream_selected_cache.up_ptr + gate_dst;
+                j[1].offset = up_src;
+                j[1].bytes = gate_expert_bytes;
+                j[1].fd = g_model_fd;
+                j[2].dst = g_stream_selected_cache.down_ptr + down_dst;
+                j[2].offset = down_src;
+                j[2].bytes = down_expert_bytes;
+                j[2].fd = g_model_fd;
+                fetch_njobs += 3;
+            } else if (!cuda_model_copy_to_device_streamed(g_stream_selected_cache.gate_ptr + gate_dst,
                                                     model_map,
                                                     model_size,
                                                     gate_src,
@@ -3074,6 +3559,15 @@ static int cuda_stream_selected_cache_begin_compact_load(
                 cuda_stream_selected_cache_invalidate();
                 return strict_failure ? 0 : 1;
             }
+        }
+    }
+
+    if (fetch_jobs) {
+        const int fetch_ok = cuda_fetch_execute(fetch_jobs, fetch_njobs);
+        free(fetch_jobs);
+        if (!fetch_ok) {
+            cuda_stream_selected_cache_invalidate();
+            return strict_failure ? 0 : 1;
         }
     }
 

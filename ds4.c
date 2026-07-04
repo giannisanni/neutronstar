@@ -16677,10 +16677,14 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
         uint64_t                  gate_expert_bytes,
         uint64_t                  down_expert_bytes) {
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    /* n_tokens == 1 must also take the selected load. The MTP verifier can
+     * issue single-position ffn batch encodes; skipping the selected load
+     * there falls through to resident full-expert ranges, which cannot fit
+     * in device memory under SSD streaming. */
     if (!metal_graph_decode_cuda_selected_slots_expected(g, layer) ||
         !model ||
         !g->batch_router_selected ||
-        n_tokens <= 1 ||
+        n_tokens == 0 ||
         DS4_N_EXPERT == 0 ||
         DS4_N_EXPERT_USED == 0 ||
         getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_LOAD") != NULL) {
@@ -38782,7 +38786,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        if (e->ssd_streaming) {
+        /* Experimental: DS4_MTP_STREAMING_UNSAFE=1 bypasses the guard so the
+         * combination can be tested. Verified-greedy output should match
+         * plain greedy; any divergence or crash means a sub-path still
+         * assumes resident weights. */
+        if (e->ssd_streaming && getenv("DS4_MTP_STREAMING_UNSAFE") == NULL) {
             fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp yet\n");
             ds4_engine_close(e);
             *out = NULL;
