@@ -30122,7 +30122,9 @@ static bool glm_graph_forward_tokens(
                                       0,
                                       input_hc,
                                       (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float)) != 0;
-        } else {
+        } else if (!g->streaming_static_decode_map_current) {
+            /* under the live static decode map installs are skipped: on CUDA
+             * every install releases the whole model range cache */
             ok = glm_graph_stream_map_token(g, model, weights);
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -30187,12 +30189,14 @@ static bool glm_graph_forward_tokens(
             break;
         }
         if (g->ssd_streaming) {
-            ok = glm_graph_stream_map_prefill_layer(g,
-                                                    model,
-                                                    weights,
-                                                    il,
-                                                    n_tokens,
-                                                    full_layer_prefill);
+            if (!g->streaming_static_decode_map_current) {
+                ok = glm_graph_stream_map_prefill_layer(g,
+                                                        model,
+                                                        weights,
+                                                        il,
+                                                        n_tokens,
+                                                        full_layer_prefill);
+            }
             if (ok && layer_prepare && layer_prepare_overlap) {
                 bool started_future = false;
                 for (uint32_t ahead = 1; ahead <= layer_prepare_ahead; ahead++) {
@@ -30687,7 +30691,9 @@ static bool glm_graph_forward_tokens(
                                                         DS4_N_EMBD,
                                                         DS4_N_EMBD);
         ok = last_hidden != NULL;
-        if (ok && g->ssd_streaming) ok = glm_graph_stream_map_output(g, model, weights);
+        if (ok && g->ssd_streaming && !g->streaming_static_decode_map_current) {
+            ok = glm_graph_stream_map_output(g, model, weights);
+        }
         if (ok) ok = glm_graph_forward_output_head(g, model, weights, last_hidden, logits_out);
         if (ok) {
             glm_graph_report_prefill_display_progress(display_progress,
@@ -30834,9 +30840,13 @@ static bool glm_graph_forward_indexed_tokens(
         !force_scalar_attn && glm_graph_indexed_prefill_batch_qk_low();
     const bool use_batch_attn_kernel =
         !force_scalar_attn && glm_graph_indexed_prefill_batch_attn_kernel();
+    /* The split lora fast path hard-requires the f16 compact cache (Apple);
+     * with the f32 cache (CUDA) its launchers reject and the batch dies, so
+     * route to the generic indexed batch attention instead. */
     const bool use_split_value_proj =
         use_batch_attn_kernel &&
-        g->batch_attn_lora;
+        g->batch_attn_lora &&
+        glm_graph_compact_cache_is_f16() != 0;
     const bool use_batch_q_rank_proj = true;
     const bool use_batch_q_proj = true;
     const bool use_batch_indexer_k_proj = true;
@@ -30882,7 +30892,9 @@ static bool glm_graph_forward_indexed_tokens(
                                       0,
                                       input_hc,
                                       (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float)) != 0;
-        } else {
+        } else if (!g->streaming_static_decode_map_current) {
+            /* under the live static decode map installs are skipped: on CUDA
+             * every install releases the whole model range cache */
             ok = glm_graph_stream_map_token(g, model, weights);
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -30950,12 +30962,14 @@ static bool glm_graph_forward_indexed_tokens(
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
         const uint32_t slice_layer_done = il - g->layer_start + 1u;
         if (g->ssd_streaming) {
-            ok = glm_graph_stream_map_prefill_layer(g,
-                                                    model,
-                                                    weights,
-                                                    il,
-                                                    n_tokens,
-                                                    false);
+            if (!g->streaming_static_decode_map_current) {
+                ok = glm_graph_stream_map_prefill_layer(g,
+                                                        model,
+                                                        weights,
+                                                        il,
+                                                        n_tokens,
+                                                        false);
+            }
             if (ok) ok = ds4_gpu_begin_commands() != 0;
         }
         const ds4_layer_weights *l = &weights->layer[il];
@@ -31898,7 +31912,9 @@ static bool glm_graph_forward_indexed_tokens(
                                                         DS4_N_EMBD,
                                                         DS4_N_EMBD);
         ok = last_hidden != NULL;
-        if (ok && g->ssd_streaming) ok = glm_graph_stream_map_output(g, model, weights);
+        if (ok && g->ssd_streaming && !g->streaming_static_decode_map_current) {
+            ok = glm_graph_stream_map_output(g, model, weights);
+        }
         if (ok) ok = glm_graph_forward_output_head(g, model, weights, last_hidden, logits_out);
         if (ok) {
             glm_graph_report_prefill_display_progress(display_progress,
@@ -32493,6 +32509,54 @@ static uint32_t glm_graph_mtp_chain_depth(void) {
     unsigned long v = strtoul(env, &end, 10);
     if (end == env || v == 0) return 1;
     return v > 8 ? 8u : (uint32_t)v;
+}
+
+/* Batch-verify draft tokens through the indexed prefill path: one streamed
+ * pass over n_tokens positions (per-layer expert unions instead of per-token
+ * fetches), then per-row logits via the single-vector output head. hc_rows
+ * receives every row's final hidden (host); on return g->cur holds the LAST
+ * row's hidden, which is exactly the seed state for the next draft chain. */
+static bool glm_graph_mtp_verify_tokens(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const int         *tokens,
+        uint32_t           pos0,
+        uint32_t           n_tokens,
+        float             *hc_rows,
+        float             *logits_rows) {
+    if (!g || !tokens || !hc_rows || !logits_rows || n_tokens == 0) return false;
+    bool batch_ok;
+    if (g->full_kv_cache) {
+        /* small-context configs decode with full attention; the indexed batch
+         * path is reserved for beyond-cap positions there */
+        batch_ok = glm_graph_forward_tokens(g, model, weights, tokens, NULL,
+                                            pos0, n_tokens, hc_rows, NULL,
+                                            NULL, NULL, 0, 0, 0);
+    } else {
+        if (!glm_graph_indexed_prefill_batch_ready(g, pos0)) return false;
+        if (glm_graph_limit_indexed_prefill_chunk(pos0, n_tokens) < n_tokens) return false;
+        batch_ok = glm_graph_forward_indexed_tokens(g, model, weights, tokens, NULL,
+                                                    pos0, n_tokens, hc_rows, NULL,
+                                                    NULL, NULL, 0, 0, 0);
+    }
+    if (!batch_ok) return false;
+    if (g->ssd_streaming && !g->streaming_static_decode_map_current &&
+        !glm_graph_stream_map_output(g, model, weights)) {
+        return false;
+    }
+    for (uint32_t r = 0; r < n_tokens; r++) {
+        if (ds4_gpu_tensor_write(g->cur, 0,
+                                 hc_rows + (uint64_t)r * DS4_N_EMBD,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) == 0) {
+            return false;
+        }
+        if (!glm_graph_forward_output_head(g, model, weights, g->cur,
+                                           logits_rows + (uint64_t)r * DS4_N_VOCAB)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool glm_graph_forward_token(
@@ -33703,15 +33767,27 @@ static int generate_glm_metal_argmax(
     /* MTP probe (Phase A): draft next-token after each decode step and score
      * it against the following argmax. This path has no session, so the probe
      * lives here; gated on the env plus the blk.78 nextn tensors being bound. */
-    const bool mtp_probe =
-        getenv("DS4_MTP_PROBE") != NULL &&
+    const bool mtp_nextn_bound =
         weights->layer[DS4_N_LAYER - 1u].nextn_eh_proj != NULL;
+    const bool mtp_accept =
+        getenv("DS4_GLM_MTP_ACCEPT") != NULL && mtp_nextn_bound;
+    const bool mtp_probe =
+        getenv("DS4_MTP_PROBE") != NULL && mtp_nextn_bound && !mtp_accept;
+    const bool mtp_draft_on = mtp_probe || mtp_accept;
     float *mtp_logits =
-        mtp_probe ? xmalloc((size_t)DS4_N_VOCAB * sizeof(mtp_logits[0])) : NULL;
+        mtp_draft_on ? xmalloc((size_t)DS4_N_VOCAB * sizeof(mtp_logits[0])) : NULL;
+    float *mtp_hc =
+        mtp_accept ? xmalloc(2u * (size_t)DS4_N_EMBD * sizeof(mtp_hc[0])) : NULL;
+    float *mtp_vlogits =
+        mtp_accept ? xmalloc(2u * (size_t)DS4_N_VOCAB * sizeof(mtp_vlogits[0])) : NULL;
+    unsigned long long mtp_batches = 0, mtp_accepted = 0;
     /* Pending draft chain: pend[0..pend_n) predicts the next pend_n tokens;
      * pend_i tracks how many have been confirmed so far. A mismatch kills the
-     * rest of the chain (later drafts are conditioned on the wrong token). */
-    const uint32_t mtp_depth = glm_graph_mtp_chain_depth();
+     * rest of the chain (later drafts are conditioned on the wrong token).
+     * Accept mode verifies pend[1] in a 2-token batch, so deeper chains are
+     * wasted work there; the measured d3 rate (9%) says depth 2 is the cap. */
+    const uint32_t mtp_depth =
+        mtp_accept ? 2u : glm_graph_mtp_chain_depth();
     int pend[8];
     uint32_t pend_n = 0, pend_i = 0;
     unsigned long long chain_hit[8] = {0}, chain_tot[8] = {0};
@@ -33747,27 +33823,88 @@ static int generate_glm_metal_argmax(
             break;
         }
 
-        const double t_eval0 = token_timing ? now_sec() : 0.0;
-        ok = glm_graph_forward_token(&g, model, weights, token, NULL, pos, NULL, logits);
-        if (!ok) {
-            fprintf(stderr, "ds4: GLM Metal decode failed at position %u\n", pos);
-            free(logits);
-            free(mtp_logits);
-            glm_graph_free(&g);
-            return 1;
+        /* Speculative accept: when the pending chain called this token (d1)
+         * and offers a d2, evaluate [token, d2] as one indexed batch instead
+         * of a single forward. Row 0's logits tell whether d2 is what the
+         * model would have produced; row 1's logits continue past it. KV rows
+         * a rejected d2 wrote are overwritten by the next eval at that
+         * position, so rollback is implicit. */
+        bool used_batch = false;
+        int seed_token = token;
+        uint32_t seed_pos = pos;
+        if (mtp_accept && getenv("DS4_MTP_PROBE") != NULL) {
+            fprintf(stderr,
+                    "ds4: mtp accept gate pend_n=%u pend0=%d token=%d ngen=%d\n",
+                    pend_n, pend_n != 0 ? pend[0] : -1, token, n_generated);
         }
-        if (mtp_probe) {
-            /* Seed step runs every token so the draft KV stays contiguous;
-             * g.cur still holds the final hidden for `token` at `pos`. The
-             * chain is only extended once the pending one is used up. */
-            if (glm_graph_eval_mtp_draft(&g, model, weights, token, pos, mtp_logits)) {
+        if (mtp_accept && pend_n >= 2 && token == pend[0] &&
+            n_generated < n_predict &&
+            pos + 2u < g.ctx_size) {
+            int vt[2] = { token, pend[1] };
+            if (glm_graph_mtp_verify_tokens(&g, model, weights, vt, pos, 2,
+                                            mtp_hc, mtp_vlogits)) {
+                used_batch = true;
+                mtp_batches++;
+                const int next0 = sample_argmax(mtp_vlogits, DS4_N_VOCAB);
+                if (next0 == pend[1] &&
+                    !vocab_token_is_generation_stop(vocab, pend[1])) {
+                    if (emit) emit(emit_ud, pend[1]);
+                    n_generated++;
+                    mtp_accepted++;
+                    memcpy(logits, mtp_vlogits + DS4_N_VOCAB,
+                           (size_t)DS4_N_VOCAB * sizeof(float));
+                    /* g.cur already holds row 1's hidden from the head loop */
+                    seed_token = pend[1];
+                    seed_pos = pos + 1u;
+                    pos += 2u;
+                } else {
+                    memcpy(logits, mtp_vlogits,
+                           (size_t)DS4_N_VOCAB * sizeof(float));
+                    (void)ds4_gpu_tensor_write(g.cur, 0, mtp_hc,
+                                               (uint64_t)DS4_N_EMBD * sizeof(float));
+                    seed_pos = pos;
+                    pos += 1u;
+                }
+                n_decode_eval += 2;
+            }
+        }
+        if (mtp_accept) { pend_n = 0; pend_i = 0; }
+        if (!used_batch) {
+            const double t_eval0 = token_timing ? now_sec() : 0.0;
+            ok = glm_graph_forward_token(&g, model, weights, token, NULL, pos, NULL, logits);
+            if (!ok) {
+                fprintf(stderr, "ds4: GLM Metal decode failed at position %u\n", pos);
+                free(logits);
+                free(mtp_logits);
+                free(mtp_hc);
+                free(mtp_vlogits);
+                glm_graph_free(&g);
+                return 1;
+            }
+            if (token_timing) {
+                const double t_eval1 = now_sec();
+                fprintf(stderr,
+                        "ds4: GLM decode eval %d took %.3f ms\n",
+                        n_decode_eval + 1,
+                        (t_eval1 - t_eval0) * 1000.0);
+            }
+            seed_pos = pos;
+            pos++;
+            n_decode_eval++;
+        }
+        if (mtp_draft_on) {
+            /* Seed step runs every committed token so the draft KV stays
+             * contiguous; g.cur holds the final hidden for seed_token at
+             * seed_pos on both paths. The chain is only extended once the
+             * pending one is used up. */
+            if (glm_graph_eval_mtp_draft(&g, model, weights, seed_token, seed_pos, mtp_logits)) {
                 if (pend_i >= pend_n) {
                     pend[0] = sample_argmax(mtp_logits, DS4_N_VOCAB);
                     pend_n = 1;
                     pend_i = 0;
                     for (uint32_t k = 1; k < mtp_depth; k++) {
                         if (!glm_graph_eval_mtp_draft_chain_step(&g, model, weights,
-                                                                 pend[k - 1], pos + k,
+                                                                 pend[k - 1], seed_pos + k,
                                                                  mtp_logits)) {
                             break;
                         }
@@ -33775,19 +33912,10 @@ static int generate_glm_metal_argmax(
                         pend_n = k + 1u;
                     }
                 }
-            } else {
+            } else if (mtp_probe) {
                 fprintf(stderr, "ds4: mtp probe draft failed\n");
             }
         }
-        if (token_timing) {
-            const double t_eval1 = now_sec();
-            fprintf(stderr,
-                    "ds4: GLM decode eval %d took %.3f ms\n",
-                    n_decode_eval + 1,
-                    (t_eval1 - t_eval0) * 1000.0);
-        }
-        n_decode_eval++;
-        pos++;
     }
     const double t_decode1 = now_sec();
     if (done) done(emit_ud);
@@ -33811,9 +33939,22 @@ static int generate_glm_metal_argmax(
         }
         fprintf(stderr, "\n");
     }
+    if (mtp_accept) {
+        fprintf(stderr,
+                "ds4: mtp accept summary: batches=%llu accepted=%llu (%.0f%%) "
+                "tokens=%d evals=%d\n",
+                mtp_batches,
+                mtp_accepted,
+                mtp_batches != 0 ?
+                    100.0 * (double)mtp_accepted / (double)mtp_batches : 0.0,
+                n_generated,
+                n_decode_eval);
+    }
     if (memory_report) ds4_gpu_print_memory_report("before GLM graph free");
     free(logits);
     free(mtp_logits);
+    free(mtp_hc);
+    free(mtp_vlogits);
     glm_graph_free(&g);
     return 0;
 }

@@ -1198,7 +1198,30 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
 
     const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
     void *dev = NULL;
-    cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
+    cudaError_t err = cudaSuccess;
+    /* Optional VRAM headroom: skip device chunks once free VRAM drops below
+     * the reserve so batch/verify kernels can still launch mid-decode. The
+     * chunk then lands in the pinned-host fallback below. Default 0 keeps the
+     * greedy fill-VRAM-first behavior. */
+    static int reserve_parsed = -1;
+    static uint64_t reserve_bytes = 0;
+    if (reserve_parsed < 0) {
+        reserve_parsed = 0;
+        const char *renv = getenv("DS4_CUDA_ARENA_VRAM_RESERVE_GB");
+        if (renv && renv[0]) {
+            char *rend = NULL;
+            unsigned long long rv = strtoull(renv, &rend, 10);
+            if (rend != renv) reserve_bytes = (uint64_t)rv * 1073741824ull;
+        }
+    }
+    if (reserve_bytes != 0) {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess &&
+            (uint64_t)free_b < reserve_bytes + chunk) {
+            err = cudaErrorMemoryAllocation;
+        }
+    }
+    if (err == cudaSuccess) err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
         /* Device arena is full: fall back to pinned host memory mapped
          * into the GPU's address space (zero-copy). This keeps models
