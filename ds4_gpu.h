@@ -103,6 +103,10 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
+int ds4_gpu_stream_expert_cache_prefetch(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor              *selected,
+        uint32_t                           n_selected);
 #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
 int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const ds4_gpu_stream_expert_table *table,
