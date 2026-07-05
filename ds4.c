@@ -26915,15 +26915,16 @@ static bool glm_graph_down_type_supported(uint32_t down_type) {
 
 static bool glm_graph_layer_uses_generic_routed_moe(
         const ds4_layer_weights *l) {
-    /* The generic (DeepSeek) routed-MoE kernel only supports the IQ2_XXS gate +
-     * Q2_K down quant combo. GLM UD quants keep the down projection in IQ2_XXS,
-     * which that kernel rejects, so route those layers to the GLM MoE path. */
+    /* The generic (DeepSeek) routed-MoE kernels take IQ2_XXS gate/up with the
+     * down projection in Q2_K (DeepSeek quants) or IQ2_XXS (GLM UD
+     * RoutedIQ2XXS quants). Other combos fall back to the GLM MoE path. */
     return l &&
            l->ffn_gate_exps &&
            l->ffn_up_exps &&
            l->ffn_down_exps &&
            l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
-           l->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+           (l->ffn_down_exps->type == DS4_TENSOR_Q2_K ||
+            l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS);
 }
 
 static bool glm_graph_stream_map_token(

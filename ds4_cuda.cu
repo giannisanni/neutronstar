@@ -2064,6 +2064,37 @@ static int cuda_stream_expert_cache_copy_to_compact(
                    "streaming selected down cache copy");
 }
 
+/* Reverse of copy_to_compact: after a parallel fetch lands a missed expert in
+ * the compact buffers, mirror it into a cache slot device-to-device (cheap)
+ * instead of re-reading it from disk through the serial mmap path. */
+static int cuda_stream_expert_cache_backfill_from_compact(
+        cuda_stream_expert_cache *cache,
+        uint32_t cache_slot,
+        uint32_t compact_slot,
+        const char *compact_gate,
+        const char *compact_up,
+        const char *compact_down) {
+    const uint64_t gate_dst = (uint64_t)cache_slot * cache->gate_expert_bytes;
+    const uint64_t down_dst = (uint64_t)cache_slot * cache->down_expert_bytes;
+    const uint64_t gate_src = (uint64_t)compact_slot * cache->gate_expert_bytes;
+    const uint64_t down_src = (uint64_t)compact_slot * cache->down_expert_bytes;
+    return cuda_ok(cudaMemcpy(cache->gate_ptr + gate_dst,
+                              compact_gate + gate_src,
+                              (size_t)cache->gate_expert_bytes,
+                              cudaMemcpyDeviceToDevice),
+                   "streaming gate cache backfill") &&
+           cuda_ok(cudaMemcpy(cache->up_ptr + gate_dst,
+                              compact_up + gate_src,
+                              (size_t)cache->gate_expert_bytes,
+                              cudaMemcpyDeviceToDevice),
+                   "streaming up cache backfill") &&
+           cuda_ok(cudaMemcpy(cache->down_ptr + down_dst,
+                              compact_down + down_src,
+                              (size_t)cache->down_expert_bytes,
+                              cudaMemcpyDeviceToDevice),
+                   "streaming down cache backfill");
+}
+
 static int cuda_stream_expert_cache_load_slot(
         cuda_stream_expert_cache *cache,
         const void *model_map,
@@ -3461,6 +3492,14 @@ static int cuda_stream_selected_cache_begin_compact_load(
                                               sizeof(cuda_fetch_job));
         /* NULL is fine: falls back to the serial path below */
     }
+    /* Global-cache misses fetched by the pool, to mirror into cache slots
+     * after the batch lands: {compact index, expert id} pairs. */
+    uint32_t *backfill = NULL;
+    uint32_t backfill_count = 0;
+    if (fetch_jobs) {
+        backfill = (uint32_t *)calloc((size_t)compact_count * 2u,
+                                      sizeof(uint32_t));
+    }
     cuda_bundle_init();
     const cuda_bundle_layer *bundle = fetch_jobs != NULL ?
         cuda_bundle_layer_get(layer, gate_expert_bytes, down_expert_bytes) :
@@ -3473,6 +3512,8 @@ static int cuda_stream_selected_cache_begin_compact_load(
                     compact_ids[i],
                     n_total_expert,
                     layer);
+            free(fetch_jobs);
+            free(backfill);
             return 0;
         }
 
@@ -3498,6 +3539,16 @@ static int cuda_stream_selected_cache_begin_compact_load(
                 cache_hits++;
                 expert_cache->slots[(uint32_t)cache_slot].age =
                     ++expert_cache->tick;
+            } else if (backfill) {
+                /* Parallel fetch active: read the miss straight into the
+                 * compact buffers via the thread pool (which also consults
+                 * the host expert cache) and mirror it into a cache slot
+                 * afterwards. The serial load_slot mmap path caps effective
+                 * disk throughput at SATA-class rates. */
+                cache_misses++;
+                backfill[backfill_count * 2u] = i;
+                backfill[backfill_count * 2u + 1u] = (uint32_t)expert;
+                backfill_count++;
             } else {
                 cache_misses++;
                 const uint32_t load_slot =
@@ -3603,10 +3654,48 @@ static int cuda_stream_selected_cache_begin_compact_load(
         const int fetch_ok = cuda_fetch_execute(fetch_jobs, fetch_njobs);
         free(fetch_jobs);
         if (!fetch_ok) {
+            free(backfill);
             cuda_stream_selected_cache_invalidate();
             return strict_failure ? 0 : 1;
         }
     }
+    if (backfill && backfill_count != 0 && !expert_cache_disabled &&
+        expert_cache && expert_cache->valid) {
+        for (uint32_t b = 0; b < backfill_count; b++) {
+            const uint32_t compact_slot = backfill[b * 2u];
+            const uint32_t expert_id = backfill[b * 2u + 1u];
+            const uint32_t slot =
+                cuda_stream_expert_cache_lru_slot(expert_cache);
+            const int append = !expert_cache->slots[slot].valid;
+            if (!cuda_stream_expert_cache_backfill_from_compact(
+                    expert_cache,
+                    slot,
+                    compact_slot,
+                    g_stream_selected_cache.gate_ptr,
+                    g_stream_selected_cache.up_ptr,
+                    g_stream_selected_cache.down_ptr)) {
+                cuda_stream_expert_cache_invalidate();
+                break;
+            }
+            cuda_stream_expert_cache_slot &entry = expert_cache->slots[slot];
+            entry.valid = 1;
+            entry.model_map = model_map;
+            entry.model_size = model_size;
+            entry.layer = layer;
+            entry.n_total_expert = n_total_expert;
+            entry.expert = expert_id;
+            entry.gate_offset = gate_offset;
+            entry.up_offset = up_offset;
+            entry.down_offset = down_offset;
+            entry.gate_expert_bytes = gate_expert_bytes;
+            entry.down_expert_bytes = down_expert_bytes;
+            entry.age = ++expert_cache->tick;
+            if (append && expert_cache->count < expert_cache->capacity) {
+                expert_cache->count++;
+            }
+        }
+    }
+    free(backfill);
 
     if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
                             slot_ids,
@@ -12208,6 +12297,61 @@ __global__ static void moe_down_sorted_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
 }
 
+/* IQ2_XXS twins of moe_down_qwarp32 / moe_down_sorted_qwarp32 for quants
+ * that keep the routed down projection in IQ2_XXS (GLM UD RoutedIQ2XXS). */
+__global__ static void moe_down_iq2xxs_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t pair = blockIdx.y;
+    if (row >= out_dim) return;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_iq2_xxs_q8_K_block(wr + b, xq + b);
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
+}
+
+__global__ static void moe_down_iq2xxs_sorted_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const uint32_t *sorted_pairs,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    uint32_t pair = sorted_pairs[blockIdx.y];
+    if (row >= out_dim) return;
+    uint32_t tok = pair / n_expert;
+    uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const cuda_block_iq2_xxs *wr = (const cuda_block_iq2_xxs *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_iq2_xxs_q8_K_block(wr + b, xq + b);
+    acc = quarter_warp_sum_f32(acc, lane);
+    if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = acc;
+}
+
 __global__ static DS4_CUDA_UNUSED void moe_down_expert_tile8_kernel(
         float *down_out,
         const char *down_base,
@@ -12824,7 +12968,10 @@ static int routed_moe_launch(
         return 0;
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+    /* IQ2_XXS gate pairs with a Q2_K down (DeepSeek quants) or an IQ2_XXS
+     * down (GLM UD RoutedIQ2XXS quants). */
+    const int iq2xxs_down = (!q4k_path && down_type == 16u);
+    if (!q4k_path && (gate_type != 16u || (down_type != 10u && down_type != 16u))) return 0;
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
@@ -12896,7 +13043,7 @@ static int routed_moe_launch(
         const uint32_t expert_tile_m = (!q4k_path && getenv("DS4_CUDA_MOE_TILE4")) ? 4u : 8u;
         const uint32_t write_gate_up = getenv("DS4_CUDA_MOE_WRITE_GATE_UP") != NULL;
         const uint32_t use_p2_sorted = use_sorted_pairs && !q4k_path && getenv("DS4_CUDA_MOE_NO_P2") == NULL;
-        const uint32_t use_atomic_down = use_expert_tiles &&
+        const uint32_t use_atomic_down = use_expert_tiles && !iq2xxs_down &&
             getenv("DS4_CUDA_MOE_NO_ATOMIC_DOWN") == NULL &&
             (getenv("DS4_CUDA_MOE_ATOMIC_DOWN") != NULL ||
              (!q4k_path && n_tokens >= 128u));
@@ -12931,7 +13078,7 @@ static int routed_moe_launch(
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW128") == NULL &&
               getenv("DS4_CUDA_MOE_NO_DOWN_ROW64") == NULL));
         const uint32_t use_direct_down_sum6 =
-            n_tokens == 1u && n_expert == 6u &&
+            n_tokens == 1u && n_expert == 6u && !iq2xxs_down &&
             getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
         uint32_t *sorted_pairs = NULL;
         uint32_t *sorted_offsets = NULL;
@@ -13257,7 +13404,8 @@ static int routed_moe_launch(
             }
             if (use_direct_down_sum6) {
                 /* The direct decode kernel writes the final token row. */
-            } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
+            } else if (!iq2xxs_down &&
+                sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
                 down_tile_total && down_tile_experts && down_tile_starts) {
                 if (q4k_path) {
                     if (use_down_row2048) {
@@ -13367,7 +13515,7 @@ static int routed_moe_launch(
                         down_tile_total, down_tile_experts, down_tile_starts, down_expert_bytes, down_row_bytes,
                         midq_blocks, out_dim, n_expert, use_atomic_down);
                 }
-            } else if (sorted_pairs && use_p2_sorted) {
+            } else if (!iq2xxs_down && sorted_pairs && use_p2_sorted) {
                 dim3 p2_dgrid((out_dim + 15u) / 16u, (pair_count + 1u) / 2u, 1);
                 moe_down_sorted_p2_qwarp32_kernel<<<p2_dgrid, 256>>>(
                     (float *)down->ptr,
@@ -13382,20 +13530,45 @@ static int routed_moe_launch(
                     n_expert,
                     pair_count);
             } else if (!q4k_path && sorted_pairs) {
-                moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
-                    (float *)down->ptr,
-                    down_w,
-                    midq,
-                    sorted_pairs,
-                    selected_ptr,
-                    down_expert_bytes,
-                    down_row_bytes,
-                    midq_blocks,
-                    out_dim,
-                    n_expert);
+                if (iq2xxs_down) {
+                    moe_down_iq2xxs_sorted_qwarp32_kernel<<<dgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w,
+                        midq,
+                        sorted_pairs,
+                        selected_ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert);
+                } else {
+                    moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w,
+                        midq,
+                        sorted_pairs,
+                        selected_ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert);
+                }
             } else {
                 if (q4k_path) {
                     moe_down_q4K_qwarp32_kernel<<<dgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w,
+                        midq,
+                        selected_ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert);
+                } else if (iq2xxs_down) {
+                    moe_down_iq2xxs_qwarp32_kernel<<<dgrid, 256>>>(
                         (float *)down->ptr,
                         down_w,
                         midq,
