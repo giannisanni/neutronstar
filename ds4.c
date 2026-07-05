@@ -32356,9 +32356,15 @@ static bool glm_graph_eval_mtp_draft(
     if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at attn-kv\n");
 
     /* draft cache holds only decode-time draft rows; select the contiguous
-     * recent window ending at pos (real positions, so key RoPE is correct). */
-    if (!g->mtp_draft_have || pos != g->mtp_draft_last + 1u) g->mtp_draft_first = pos;
-    g->mtp_draft_last = pos;
+     * recent window ending at pos (real positions, so key RoPE is correct).
+     * Rewrites of rows inside [first, last+1] keep the window: seed steps
+     * refresh rows a prior chain wrote without invalidating the history. */
+    if (!g->mtp_draft_have ||
+        pos < g->mtp_draft_first ||
+        pos > g->mtp_draft_last + 1u) {
+        g->mtp_draft_first = pos;
+    }
+    if (!g->mtp_draft_have || pos > g->mtp_draft_last) g->mtp_draft_last = pos;
     g->mtp_draft_have = 1;
     uint32_t win_lo = g->mtp_draft_first;
     if (pos + 1u > DS4_GLM_MTP_DRAFT_WINDOW &&
@@ -32461,6 +32467,32 @@ static bool glm_graph_eval_mtp_draft(
                                      (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at head\n");
     return ok;
+}
+
+/* Chain continuation: the draft step reads its hidden input from g->cur and
+ * leaves its own output hidden in g->next, so recursive multi-token drafting
+ * (DeepSeek MTP style: the draft layer feeds itself) is a pointer swap plus
+ * another step at the next position. */
+static bool glm_graph_eval_mtp_draft_chain_step(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        int                token,
+        uint32_t           pos,
+        float             *logits_out) {
+    ds4_gpu_tensor *tmp = g->cur;
+    g->cur = g->next;
+    g->next = tmp;
+    return glm_graph_eval_mtp_draft(g, model, weights, token, pos, logits_out);
+}
+
+static uint32_t glm_graph_mtp_chain_depth(void) {
+    const char *env = getenv("DS4_GLM_MTP_DEPTH");
+    if (!env || !env[0]) return 4;
+    char *end = NULL;
+    unsigned long v = strtoul(env, &end, 10);
+    if (end == env || v == 0) return 1;
+    return v > 8 ? 8u : (uint32_t)v;
 }
 
 static bool glm_graph_forward_token(
@@ -33676,8 +33708,13 @@ static int generate_glm_metal_argmax(
         weights->layer[DS4_N_LAYER - 1u].nextn_eh_proj != NULL;
     float *mtp_logits =
         mtp_probe ? xmalloc((size_t)DS4_N_VOCAB * sizeof(mtp_logits[0])) : NULL;
-    int mtp_draft = -1;
-    unsigned long long mtp_hit = 0, mtp_total = 0;
+    /* Pending draft chain: pend[0..pend_n) predicts the next pend_n tokens;
+     * pend_i tracks how many have been confirmed so far. A mismatch kills the
+     * rest of the chain (later drafts are conditioned on the wrong token). */
+    const uint32_t mtp_depth = glm_graph_mtp_chain_depth();
+    int pend[8];
+    uint32_t pend_n = 0, pend_i = 0;
+    unsigned long long chain_hit[8] = {0}, chain_tot[8] = {0};
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < g.ctx_size; i++) {
         if (getenv("DS4_TRACE_TOP") != NULL) {
@@ -33686,16 +33723,20 @@ static int generate_glm_metal_argmax(
             print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
         }
         const int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (mtp_probe && mtp_draft >= 0) {
-            mtp_total++;
-            if (mtp_draft == token) mtp_hit++;
+        if (mtp_probe && pend_i < pend_n) {
+            const int draft = pend[pend_i];
+            chain_tot[pend_i]++;
+            const bool match = draft == token;
+            if (match) chain_hit[pend_i]++;
             fprintf(stderr,
-                    "ds4: mtp probe token=%d draft=%d hit=%llu/%llu\n",
+                    "ds4: mtp probe depth=%u token=%d draft=%d hit=%llu/%llu\n",
+                    pend_i + 1u,
                     token,
-                    mtp_draft,
-                    mtp_hit,
-                    mtp_total);
-            mtp_draft = -1;
+                    draft,
+                    chain_hit[pend_i],
+                    chain_tot[pend_i]);
+            if (match) pend_i++;
+            else { pend_n = 0; pend_i = 0; }
         }
         if (vocab_token_is_generation_stop(vocab, token)) break;
         if (emit) emit(emit_ud, token);
@@ -33716,9 +33757,24 @@ static int generate_glm_metal_argmax(
             return 1;
         }
         if (mtp_probe) {
-            /* g.cur still holds the final hidden for `token` at `pos` */
+            /* Seed step runs every token so the draft KV stays contiguous;
+             * g.cur still holds the final hidden for `token` at `pos`. The
+             * chain is only extended once the pending one is used up. */
             if (glm_graph_eval_mtp_draft(&g, model, weights, token, pos, mtp_logits)) {
-                mtp_draft = sample_argmax(mtp_logits, DS4_N_VOCAB);
+                if (pend_i >= pend_n) {
+                    pend[0] = sample_argmax(mtp_logits, DS4_N_VOCAB);
+                    pend_n = 1;
+                    pend_i = 0;
+                    for (uint32_t k = 1; k < mtp_depth; k++) {
+                        if (!glm_graph_eval_mtp_draft_chain_step(&g, model, weights,
+                                                                 pend[k - 1], pos + k,
+                                                                 mtp_logits)) {
+                            break;
+                        }
+                        pend[k] = sample_argmax(mtp_logits, DS4_N_VOCAB);
+                        pend_n = k + 1u;
+                    }
+                }
             } else {
                 fprintf(stderr, "ds4: mtp probe draft failed\n");
             }
@@ -33744,6 +33800,17 @@ static int generate_glm_metal_argmax(
             prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
             decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
 
+    if (mtp_probe) {
+        fprintf(stderr, "ds4: mtp chain summary:");
+        for (uint32_t k = 0; k < mtp_depth && chain_tot[k] != 0; k++) {
+            fprintf(stderr, " d%u=%llu/%llu (%.0f%%)",
+                    k + 1u,
+                    chain_hit[k],
+                    chain_tot[k],
+                    100.0 * (double)chain_hit[k] / (double)chain_tot[k]);
+        }
+        fprintf(stderr, "\n");
+    }
     if (memory_report) ds4_gpu_print_memory_report("before GLM graph free");
     free(logits);
     free(mtp_logits);
