@@ -4874,6 +4874,23 @@ static void weights_bind(
         weights_bind_layer(&w->layer[il], m, il);
     }
 
+    /* Bind the GLM MTP draft layer(s) that sit beyond the executable range so
+     * weights.layer[N_LAYER-1] is populated for --mtp (it holds the nextn glue
+     * plus a full GLM layer). These never run in the decode loop; they only
+     * feed glm_graph_eval_mtp_draft. Absent in GLM ggufs without an MTP block,
+     * so bind only when the block is actually present. */
+    if (!load_slice &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        executable_layers < DS4_N_LAYER) {
+        for (uint32_t il = executable_layers; il < DS4_N_LAYER; il++) {
+            char probe[64];
+            snprintf(probe, sizeof(probe), "blk.%u.nextn.eh_proj.weight", il);
+            if (model_find_tensor(m, probe) != NULL) {
+                weights_bind_layer(&w->layer[il], m, il);
+            }
+        }
+    }
+
     weights_validate_layout(w, start, end, require_token_embd, require_output);
 }
 
@@ -26361,6 +26378,12 @@ typedef struct {
     ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_value_cache[DS4_MAX_LAYER];
+    /* blk.78 MTP draft: own compact DSA KV slot + draft-window tracking */
+    ds4_gpu_tensor *mtp_kv_lora_cache;
+    ds4_gpu_tensor *mtp_k_rope_cache;
+    uint32_t mtp_draft_first;
+    uint32_t mtp_draft_last;
+    int mtp_draft_have;
     bool full_kv_cache;
     bool has_token_embd;
     bool has_output_head;
@@ -27270,6 +27293,8 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_value_cache[il]);
         ds4_gpu_tensor_free(g->layer_key_cache[il]);
     }
+    ds4_gpu_tensor_free(g->mtp_k_rope_cache);
+    ds4_gpu_tensor_free(g->mtp_kv_lora_cache);
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->batch_router_weights);
     ds4_gpu_tensor_free(g->batch_router_selected);
@@ -27690,6 +27715,10 @@ static bool glm_graph_alloc_slice(
                                            compact_indexer_key_bytes);
             }
         }
+    }
+    if (ok && g->compact_cache_cap != 0) {
+        DS4_GLM_GRAPH_ALLOC_TENSOR(g->mtp_kv_lora_cache, compact_kv_lora_bytes);
+        DS4_GLM_GRAPH_ALLOC_TENSOR(g->mtp_k_rope_cache, compact_k_rope_bytes);
     }
 #undef DS4_GLM_GRAPH_ALLOC_TENSOR
 
@@ -28407,13 +28436,19 @@ static bool glm_graph_encode_sparse_ffn_one(
         g->ssd_streaming &&
         !resident_decode_layer &&
         glm_graph_layer_uses_generic_routed_moe(l);
+    /* The slab budget check keeps off-size-class layers (e.g. a Q2_K MTP
+     * layer in an IQ2_XXS-slab model) out of the expert cache: their bigger
+     * expert payloads would overrun the slabs. They read via model views. */
     const bool uniform_streaming_selected_cache =
         g->ssd_streaming &&
         !resident_decode_layer &&
         l->ffn_gate_exps->type == l->ffn_up_exps->type &&
         l->ffn_gate_exps->type == l->ffn_down_exps->type &&
         (l->ffn_gate_exps->type == DS4_TENSOR_Q2_K ||
-         l->ffn_gate_exps->type == DS4_TENSOR_Q4_K);
+         l->ffn_gate_exps->type == DS4_TENSOR_Q4_K) &&
+        ds4_gpu_stream_expert_cache_budget_for_expert_size(
+                gate_out * gate_row_bytes,
+                down_out * down_row_bytes) >= DS4_N_EXPERT_USED;
     const bool streaming_selected_cache =
         generic_streaming_selected_cache ||
         uniform_streaming_selected_cache;
@@ -32158,6 +32193,276 @@ static bool glm_graph_end_commands_if_active(void) {
     return !ds4_gpu_commands_active() || ds4_gpu_end_commands() != 0;
 }
 
+enum { DS4_GLM_MTP_DRAFT_WINDOW = 64 };
+
+/* Install model views for the MTP draft layer. blk.78 is off the expert-cache
+ * slab class (Q2_K), so the stock layer map would pin its FULL routed expert
+ * tensors (~3.2 GiB) per draft step -- that OOM'd the 30 GiB host. Instead map
+ * the decode-static set (attention + norms + router + shared expert + nextn
+ * glue) plus, when known, only the selected experts' subranges (~4 MiB each). */
+static bool glm_graph_stream_map_mtp_draft_layer(
+        const ds4_model         *model,
+        const ds4_weights       *weights,
+        uint32_t                 il,
+        const int32_t           *experts,
+        uint32_t                 n_experts) {
+    const ds4_layer_weights *l = &weights->layer[il];
+    ds4_model_map_span_vec spans;
+    memset(&spans, 0, sizeof(spans));
+    /* token_embd too: installs replace the whole span set, and the draft
+     * embeds its input token after this map is live */
+    model_map_span_vec_include_one(&spans, weights->token_embd);
+    model_map_span_vec_include_layer_decode_static(&spans, l);
+    const ds4_tensor *exps[3] = { l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps };
+    for (uint32_t i = 0; i < n_experts; i++) {
+        if (experts[i] < 0 || (uint32_t)experts[i] >= DS4_N_EXPERT) continue;
+        for (int t = 0; t < 3; t++) {
+            const ds4_tensor *x = exps[t];
+            if (!x || x->ndim != 3 || x->dim[2] == 0) return false;
+            const uint64_t per = x->bytes / x->dim[2];
+            if (per > spans.max_tensor_bytes) spans.max_tensor_bytes = per;
+            const uint64_t lo = x->abs_offset + (uint64_t)experts[i] * per;
+            model_map_span_vec_append(&spans, lo, lo + per, false);
+        }
+    }
+    if (!model_map_span_vec_finish(&spans)) {
+        free(spans.v);
+        return false;
+    }
+    const bool ok = metal_graph_install_model_spans(model, &spans, "mtp draft layer");
+    free(spans.v);
+    return ok;
+}
+
+/* GLM-5.2 MTP speculative draft (Phase A: single-token probe).
+ *
+ * Runs the blk.78 nextn module to predict the token after `token`:
+ * project enorm(embed(token)) concat hnorm(h_final) through the fused
+ * eh_proj, run one full GLM layer (MLA attention over a short draft-only
+ * KV history plus the routed MoE), then the shared lm_head under
+ * nextn_shared_head_norm.  h_final is the post-layer-77 hidden left in
+ * g->cur by the main glm_graph_forward_token; this runs immediately after,
+ * before g->cur is reused.  The draft KV lives in its own compact slot
+ * (mtp_*) keyed by real position so key RoPE matches the main path.  Prefill
+ * rows are absent from the draft cache, so the draft attends only to the
+ * recent draft window -- the accepted Phase-A approximation, judged by the
+ * probe hit rate. */
+static bool glm_graph_eval_mtp_draft(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        int                token,
+        uint32_t           pos,
+        float             *logits_out) {
+    const bool mtp_trace = getenv("DS4_MTP_PROBE") != NULL;
+    if (!g || !model || !weights || !logits_out ||
+        token < 0 || token >= (int)DS4_N_VOCAB ||
+        g->compact_cache_cap == 0 ||
+        pos >= g->compact_cache_cap ||
+        !g->mtp_kv_lora_cache || !g->mtp_k_rope_cache) {
+        if (mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at precheck\n");
+        return false;
+    }
+    const uint32_t il = DS4_N_LAYER - 1u;               /* blk.78 */
+    const ds4_layer_weights *l = &weights->layer[il];
+    if (!l->nextn_eh_proj || !l->nextn_enorm ||
+        !l->nextn_hnorm || !l->nextn_shared_head_norm) {
+        if (mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at nextn-tensors\n");
+        return false;
+    }
+    const uint32_t kv_raw_dim = (uint32_t)l->attn_kv_a_mqa->dim[1];
+    const float rope_base = layer_rope_freq_base(il);
+    const float rope_scale = layer_rope_freq_scale(il);
+    const bool cache_f16 = glm_graph_compact_cache_is_f16();
+    const uint64_t emb_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+
+    /* Match forward_token's map policy: under the static decode map the whole
+     * model (blk.78 included) is already covered and installs must be avoided
+     * entirely -- each install releases the accelerator's model range cache,
+     * which forces a full weight-cache rebuild per draft step. */
+    const bool draft_installs_maps =
+        g->ssd_streaming &&
+        !(g->has_token_embd && metal_graph_stream_decode_static_map_enabled());
+    bool ok = true;
+    if (draft_installs_maps) {
+        ok = glm_graph_stream_map_mtp_draft_layer(model, weights, il, NULL, 0);
+        g->streaming_static_decode_map_current = false;
+    }
+    if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at stream-map\n");
+    if (ok) ok = glm_graph_begin_commands_if_needed();
+
+    /* nextn glue: consume h_final (g->cur) via hnorm before it is overwritten */
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->ffn_norm, g->cur,
+                                                model->map, model->size,
+                                                l->nextn_hnorm->abs_offset,
+                                                DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at glue-hnorm\n");
+    if (ok) ok = ds4_gpu_embed_token_q8_0_tensor(g->next, model->map, model->size,
+                                                 weights->token_embd->abs_offset,
+                                                 DS4_N_VOCAB, (uint32_t)token,
+                                                 DS4_N_EMBD) != 0;
+    if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at glue-embed\n");
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm, g->next,
+                                                model->map, model->size,
+                                                l->nextn_enorm->abs_offset,
+                                                DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at glue-enorm\n");
+    /* concat(e, h) -> g->ffn_mid; eh_proj (2*N_EMBD -> N_EMBD) -> g->cur */
+    if (ok) ok = ds4_gpu_tensor_copy(g->ffn_mid, 0, g->attn_norm, 0, emb_bytes) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(g->ffn_mid, emb_bytes, g->ffn_norm, 0, emb_bytes) != 0;
+    if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at glue-concat\n");
+    if (ok) ok = glm_graph_matmul_q8_0_decode_tensor(g->cur, model,
+                                                     l->nextn_eh_proj->abs_offset,
+                                                     2u * DS4_N_EMBD, DS4_N_EMBD,
+                                                     g->ffn_mid, g->ssd_streaming) != 0;
+    if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at glue\n");
+
+    /* layer-78 MLA attention over the draft-only KV window */
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm, g->cur,
+                                                model->map, model->size,
+                                                l->attn_norm->abs_offset,
+                                                DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    if (ok) ok = glm_graph_matmul_q8_0_decode_tensor(g->q_rank, model,
+                                                     l->attn_q_a->abs_offset,
+                                                     DS4_N_EMBD, DS4_N_LORA_Q,
+                                                     g->attn_norm, g->ssd_streaming) != 0;
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->q_rank_norm, g->q_rank,
+                                                model->map, model->size,
+                                                l->attn_q_a_norm->abs_offset,
+                                                DS4_N_LORA_Q, DS4_RMS_EPS) != 0;
+    if (ok) ok = glm_graph_matmul_q8_0_decode_tensor(g->q, model,
+                                                     l->attn_q_b->abs_offset,
+                                                     DS4_N_LORA_Q, g->q_dim,
+                                                     g->q_rank_norm, g->ssd_streaming) != 0;
+    if (ok) ok = ds4_gpu_glm_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_KEY_MLA,
+                                              DS4_N_ROT, pos, 0, rope_base, rope_scale,
+                                              0.0f, 1.0f, DS4_ROPE_YARN_BETA_FAST,
+                                              DS4_ROPE_YARN_BETA_SLOW) != 0;
+    if (ok) ok = glm_graph_matmul_q8_0_decode_tensor(g->kv_raw, model,
+                                                     l->attn_kv_a_mqa->abs_offset,
+                                                     DS4_N_EMBD, kv_raw_dim,
+                                                     g->attn_norm, g->ssd_streaming) != 0;
+    if (ok) ok = ds4_gpu_glm_kv_lora_rms_norm_tensor(g->kv_norm, g->kv_raw,
+                                                     model->map, model->size,
+                                                     l->attn_kv_a_norm->abs_offset,
+                                                     1, kv_raw_dim, DS4_N_KV_LORA,
+                                                     DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_glm_store_compact_kv_tensor(g->mtp_kv_lora_cache,
+                                                     g->mtp_k_rope_cache,
+                                                     g->kv_norm, g->kv_raw,
+                                                     pos, 1, g->compact_cache_cap,
+                                                     kv_raw_dim, DS4_N_KV_LORA,
+                                                     DS4_N_ROT, cache_f16) != 0;
+    if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at attn-kv\n");
+
+    /* draft cache holds only decode-time draft rows; select the contiguous
+     * recent window ending at pos (real positions, so key RoPE is correct). */
+    if (!g->mtp_draft_have || pos != g->mtp_draft_last + 1u) g->mtp_draft_first = pos;
+    g->mtp_draft_last = pos;
+    g->mtp_draft_have = 1;
+    uint32_t win_lo = g->mtp_draft_first;
+    if (pos + 1u > DS4_GLM_MTP_DRAFT_WINDOW &&
+        win_lo < pos + 1u - DS4_GLM_MTP_DRAFT_WINDOW) {
+        win_lo = pos + 1u - DS4_GLM_MTP_DRAFT_WINDOW;
+    }
+    const uint32_t sel_count = pos - win_lo + 1u;
+    int32_t sel[DS4_GLM_MTP_DRAFT_WINDOW];
+    for (uint32_t i = 0; i < sel_count; i++) sel[i] = (int32_t)(win_lo + i);
+    if (ok) ok = ds4_gpu_tensor_write(g->indexer_selected, 0, sel,
+                                      (uint64_t)sel_count * sizeof(int32_t)) != 0;
+    if (ok) ok = ds4_gpu_glm_qk_lowrank_q8_0_tensor(g->qk_low, g->q,
+                                                    model->map, model->size,
+                                                    l->attn_k_b->abs_offset,
+                                                    DS4_N_HEAD, DS4_N_KV_LORA,
+                                                    (uint32_t)g->q_nope, DS4_N_KEY_MLA) != 0;
+    if (ok) ok = ds4_gpu_glm_attention_indexed_decode_tensor(g->heads, g->q, g->qk_low,
+                                                             g->mtp_kv_lora_cache,
+                                                             g->mtp_k_rope_cache,
+                                                             model->map, model->size,
+                                                             l->attn_v_b->abs_offset,
+                                                             g->indexer_selected, sel_count,
+                                                             g->compact_cache_cap, cache_f16,
+                                                             DS4_N_HEAD, DS4_N_KV_LORA,
+                                                             (uint32_t)g->q_nope, DS4_N_ROT,
+                                                             DS4_N_VALUE_MLA, 0,
+                                                             rope_base, rope_scale, 0.0f, 1.0f,
+                                                             DS4_ROPE_YARN_BETA_FAST,
+                                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
+    if (ok) ok = glm_graph_matmul_q8_0_decode_tensor(g->attn_out, model,
+                                                     l->attn_output->abs_offset,
+                                                     g->heads_dim, DS4_N_EMBD,
+                                                     g->heads, g->ssd_streaming) != 0;
+    if (ok) ok = ds4_gpu_add_rms_norm_weight_tensor(g->ffn_norm, g->after_attn,
+                                                    g->cur, g->attn_out,
+                                                    model->map, model->size,
+                                                    l->ffn_norm->abs_offset,
+                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at attention\n");
+
+    /* Route first so the streaming map can cover just the selected experts.
+     * ffn_one reruns the identical router on the same ffn_norm, so its
+     * selection matches these indices. Skipped under the static map: no
+     * installs happen, experts resolve on demand. */
+    int32_t draft_experts[DS4_N_EXPERT_USED];
+    if (ok && draft_installs_maps) {
+        ok = ds4_gpu_matmul_f32_tensor(g->prefetch_logits, model->map, model->size,
+                                       l->ffn_gate_inp->abs_offset,
+                                       DS4_N_EMBD, DS4_N_EXPERT,
+                                       g->ffn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_glm_router_select_tensor(g->prefetch_selected,
+                                                      g->prefetch_weights,
+                                                      g->prefetch_probs,
+                                                      model->map, model->size,
+                                                      l->ffn_exp_probs_b->abs_offset,
+                                                      g->prefetch_logits,
+                                                      DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                                                      DS4_EXPERT_WEIGHT_SCALE) != 0;
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (ok) ok = ds4_gpu_tensor_read(g->prefetch_selected, 0, draft_experts,
+                                         sizeof(draft_experts)) != 0;
+        if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at router\n");
+        if (ok) {
+            ok = glm_graph_stream_map_mtp_draft_layer(model, weights, il,
+                                                      draft_experts,
+                                                      DS4_N_EXPERT_USED);
+            if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at expert-map\n");
+        }
+        if (ok) ok = glm_graph_begin_commands_if_needed();
+    }
+    /* routed MoE over layer-78 experts -> g->next */
+    if (ok) ok = glm_graph_encode_ffn_one_normed_from(g, model, l, il, pos,
+                                                      g->ffn_norm, g->after_attn, g->next,
+                                                      g->ffn_gate, g->ffn_up, g->ffn_mid,
+                                                      g->ffn_out, g->ffn_sum, g->attn_out,
+                                                      false, NULL);
+    if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at ffn\n");
+
+    /* head norm reads the layer's nextn_shared_head_norm, so run it before
+     * the output-span remap evicts the layer views */
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm, g->next,
+                                                model->map, model->size,
+                                                l->nextn_shared_head_norm->abs_offset,
+                                                DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    if (g->ssd_streaming) {
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+    }
+
+    /* shared lm_head */
+    if (draft_installs_maps && ok) ok = glm_graph_stream_map_output(g, model, weights);
+    if (ok) ok = glm_graph_begin_commands_if_needed();
+    if (ok) ok = glm_graph_matmul_q8_0_decode_tensor(g->logits, model,
+                                                     weights->output->abs_offset,
+                                                     DS4_N_EMBD, DS4_N_VOCAB,
+                                                     g->output_norm, g->ssd_streaming) != 0;
+    if (ok) ok = glm_graph_end_commands_if_active();
+    else (void)ds4_gpu_synchronize();
+    if (ok) ok = ds4_gpu_tensor_read(g->logits, 0, logits_out,
+                                     (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    if (!ok && mtp_trace) fprintf(stderr, "ds4: glm mtp draft failed at head\n");
+    return ok;
+}
+
 static bool glm_graph_forward_token(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -33363,6 +33668,16 @@ static int generate_glm_metal_argmax(
     int n_decode_eval = 0;
     uint32_t pos = (uint32_t)prompt->len;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+    /* MTP probe (Phase A): draft next-token after each decode step and score
+     * it against the following argmax. This path has no session, so the probe
+     * lives here; gated on the env plus the blk.78 nextn tensors being bound. */
+    const bool mtp_probe =
+        getenv("DS4_MTP_PROBE") != NULL &&
+        weights->layer[DS4_N_LAYER - 1u].nextn_eh_proj != NULL;
+    float *mtp_logits =
+        mtp_probe ? xmalloc((size_t)DS4_N_VOCAB * sizeof(mtp_logits[0])) : NULL;
+    int mtp_draft = -1;
+    unsigned long long mtp_hit = 0, mtp_total = 0;
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < g.ctx_size; i++) {
         if (getenv("DS4_TRACE_TOP") != NULL) {
@@ -33371,6 +33686,17 @@ static int generate_glm_metal_argmax(
             print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
         }
         const int token = sample_argmax(logits, DS4_N_VOCAB);
+        if (mtp_probe && mtp_draft >= 0) {
+            mtp_total++;
+            if (mtp_draft == token) mtp_hit++;
+            fprintf(stderr,
+                    "ds4: mtp probe token=%d draft=%d hit=%llu/%llu\n",
+                    token,
+                    mtp_draft,
+                    mtp_hit,
+                    mtp_total);
+            mtp_draft = -1;
+        }
         if (vocab_token_is_generation_stop(vocab, token)) break;
         if (emit) emit(emit_ud, token);
         n_generated++;
@@ -33385,8 +33711,17 @@ static int generate_glm_metal_argmax(
         if (!ok) {
             fprintf(stderr, "ds4: GLM Metal decode failed at position %u\n", pos);
             free(logits);
+            free(mtp_logits);
             glm_graph_free(&g);
             return 1;
+        }
+        if (mtp_probe) {
+            /* g.cur still holds the final hidden for `token` at `pos` */
+            if (glm_graph_eval_mtp_draft(&g, model, weights, token, pos, mtp_logits)) {
+                mtp_draft = sample_argmax(mtp_logits, DS4_N_VOCAB);
+            } else {
+                fprintf(stderr, "ds4: mtp probe draft failed\n");
+            }
         }
         if (token_timing) {
             const double t_eval1 = now_sec();
@@ -33411,6 +33746,7 @@ static int generate_glm_metal_argmax(
 
     if (memory_report) ds4_gpu_print_memory_report("before GLM graph free");
     free(logits);
+    free(mtp_logits);
     glm_graph_free(&g);
     return 0;
 }
@@ -39170,7 +39506,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (e->mtp_ready &&
+        if (e->mtp_ready && e->mtp_model.map &&
             !ds4_gpu_set_model_map_range(e->mtp_model.map,
                                            e->mtp_model.size,
                                            e->mtp_model.tensor_data_pos,
@@ -39212,8 +39548,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         free(load_offsets);
         free(load_sizes);
         /* Also apply explicit optional Q8 preload settings to the MTP support
-         * model when loaded. */
-        if (e->mtp_ready) {
+         * model when loaded. GLM MTP reuses the base model (no separate
+         * mtp_model), so skip when none was opened. */
+        if (e->mtp_ready && e->mtp_model.map) {
             (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd, e->mtp_model.map);
             if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
                                                  NULL, NULL, 0)) {
@@ -39416,6 +39753,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->glm_graph.ssd_streaming = e->ssd_streaming;
         s->glm_graph.ssd_streaming_cold = e->ssd_streaming_cold;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        if (e->mtp_ready) {
+            s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
+            s->mtp_draft_token = -1;
+        }
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
             char err[256];
             if (ds4_dist_session_create(&s->distributed,
@@ -39430,6 +39771,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                         err[0] ? err : "unknown error");
                 glm_graph_free(&s->glm_graph);
                 free(s->logits);
+                free(s->mtp_logits);
                 free(s);
                 return 1;
             }
@@ -41204,6 +41546,23 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             return 1;
         }
         const uint32_t pos = (uint32_t)s->checkpoint.len;
+        const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
+        const bool mtp_should_draft =
+            probe_mtp && e->mtp_ready && s->mtp_logits &&
+            (e->mtp_draft_tokens > 1 || mtp_probe_log);
+        if (probe_mtp && s->mtp_draft_valid) {
+            if (mtp_probe_log) {
+                s->mtp_probe_total++;
+                if (s->mtp_draft_token == token) s->mtp_probe_hit++;
+                fprintf(stderr,
+                        "ds4: mtp probe token=%d draft=%d hit=%llu/%llu\n",
+                        token,
+                        s->mtp_draft_token,
+                        (unsigned long long)s->mtp_probe_hit,
+                        (unsigned long long)s->mtp_probe_total);
+            }
+            s->mtp_draft_valid = false;
+        }
         const bool updates_dense =
             glm_graph_decode_updates_dense_cache(&s->glm_graph, pos, s->logits);
         if (!glm_graph_forward_token(&s->glm_graph,
@@ -41226,7 +41585,15 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         if (updates_dense) ds4_session_glm_note_dense_cache(s, pos, 1);
-        (void)probe_mtp;
+        if (mtp_should_draft) {
+            if (glm_graph_eval_mtp_draft(&s->glm_graph, &e->model, &e->weights,
+                                         token, pos, s->mtp_logits)) {
+                s->mtp_draft_token = sample_argmax(s->mtp_logits, DS4_N_VOCAB);
+                s->mtp_draft_valid = true;
+            } else if (mtp_probe_log) {
+                fprintf(stderr, "ds4: mtp probe draft failed\n");
+            }
+        }
         return 0;
     }
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
