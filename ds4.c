@@ -26266,6 +26266,7 @@ typedef struct {
     uint32_t layer_start;
     uint32_t layer_end;
     uint32_t layer_count;
+    const ds4_layer_weights *layers; /* weights->layer base, for lookahead */
     uint64_t q_dim;
     uint64_t q_nope;
     uint64_t heads_dim;
@@ -26299,6 +26300,11 @@ typedef struct {
     ds4_gpu_tensor *router_probs;
     ds4_gpu_tensor *router_selected;
     ds4_gpu_tensor *router_weights;
+    /* next-layer router scratch for speculative expert prefetch */
+    ds4_gpu_tensor *prefetch_logits;
+    ds4_gpu_tensor *prefetch_probs;
+    ds4_gpu_tensor *prefetch_selected;
+    ds4_gpu_tensor *prefetch_weights;
     ds4_gpu_tensor *output_norm;
     ds4_gpu_tensor *logits;
     ds4_gpu_tensor *batch_router_logits;
@@ -27232,6 +27238,7 @@ static bool glm_graph_validate_layout(
     g->heads_dim = (uint64_t)DS4_N_HEAD * DS4_N_VALUE_MLA;
     g->dense_hidden_max = DS4_N_FF_EXP;
     g->kv_raw_dim = 0;
+    g->layers = weights->layer;
     for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
         if (!glm_graph_validate_layer_layout(model,
                                              &weights->layer[il],
@@ -27300,6 +27307,10 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->prefill_tokens);
     ds4_gpu_tensor_free(g->output_norm);
     ds4_gpu_tensor_free(g->router_weights);
+    ds4_gpu_tensor_free(g->prefetch_weights);
+    ds4_gpu_tensor_free(g->prefetch_selected);
+    ds4_gpu_tensor_free(g->prefetch_probs);
+    ds4_gpu_tensor_free(g->prefetch_logits);
     ds4_gpu_tensor_free(g->router_selected);
     ds4_gpu_tensor_free(g->router_probs);
     ds4_gpu_tensor_free(g->router_logits);
@@ -27620,6 +27631,10 @@ static bool glm_graph_alloc_slice(
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->router_probs, (uint64_t)DS4_N_EXPERT * sizeof(float));
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->router_selected, (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->router_weights, (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+    DS4_GLM_GRAPH_ALLOC_TENSOR(g->prefetch_logits, (uint64_t)DS4_N_EXPERT * sizeof(float));
+    DS4_GLM_GRAPH_ALLOC_TENSOR(g->prefetch_probs, (uint64_t)DS4_N_EXPERT * sizeof(float));
+    DS4_GLM_GRAPH_ALLOC_TENSOR(g->prefetch_selected, (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+    DS4_GLM_GRAPH_ALLOC_TENSOR(g->prefetch_weights, (uint64_t)DS4_N_EXPERT_USED * sizeof(float));
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->output_norm, emb_bytes);
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->logits, logits_bytes);
     DS4_GLM_GRAPH_ALLOC_TENSOR(g->batch_router_logits, batch_rows * DS4_N_EXPERT * sizeof(float));
@@ -28253,6 +28268,80 @@ static double glm_graph_streaming_async_profile_ms(void) {
     return now_sec() * 1000.0;
 }
 
+/* Speculative cross-layer expert prefetch (the Fate/Pre-gated-MoE idea):
+ * approximate layer il+1's router input with layer il's normed hidden state,
+ * run the next layer's router on it, and start pulling the predicted experts
+ * into the host expert cache while il's MoE and il+1's attention compute.
+ * Best effort: failures and mispredictions only cost idle disk bandwidth.
+ * Opt in with DS4_GLM_EXPERT_PREFETCH=1 (needs the io_uring fetch engine). */
+static void glm_graph_prefetch_next_layer_experts(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        uint32_t                 il,
+        const ds4_gpu_tensor    *ffn_norm) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_GLM_EXPERT_PREFETCH");
+        enabled = env && env[0] == '1';
+    }
+    if (!enabled || !g->ssd_streaming || !g->layers) return;
+    if (il >= g->layer_end) return;
+    if (!g->prefetch_logits || !g->prefetch_probs ||
+        !g->prefetch_selected || !g->prefetch_weights) {
+        return;
+    }
+    const ds4_layer_weights *ln = &g->layers[il + 1];
+    if (!ln->ffn_gate_inp || !ln->ffn_exp_probs_b ||
+        !ln->ffn_gate_exps || !ln->ffn_up_exps || !ln->ffn_down_exps) {
+        return;
+    }
+    if (!ds4_gpu_matmul_f32_tensor(g->prefetch_logits,
+                                   model->map,
+                                   model->size,
+                                   ln->ffn_gate_inp->abs_offset,
+                                   DS4_N_EMBD,
+                                   DS4_N_EXPERT,
+                                   ffn_norm,
+                                   1)) {
+        return;
+    }
+    if (!ds4_gpu_glm_router_select_tensor(g->prefetch_selected,
+                                          g->prefetch_weights,
+                                          g->prefetch_probs,
+                                          model->map,
+                                          model->size,
+                                          ln->ffn_exp_probs_b->abs_offset,
+                                          g->prefetch_logits,
+                                          DS4_N_EXPERT,
+                                          DS4_N_EXPERT_USED,
+                                          DS4_EXPERT_WEIGHT_SCALE)) {
+        return;
+    }
+    uint64_t gate_in = 0, gate_out = 0, gate_row = 0;
+    uint64_t down_in = 0, down_out = 0, down_row = 0;
+    (void)tensor_expert_bytes(model, ln->ffn_gate_exps, 0,
+                              &gate_in, &gate_out, &gate_row);
+    (void)tensor_expert_bytes(model, ln->ffn_down_exps, 0,
+                              &down_in, &down_out, &down_row);
+    if (gate_out == 0 || gate_row == 0 || down_out == 0 || down_row == 0) {
+        return;
+    }
+    const ds4_gpu_stream_expert_table table = {
+        .model_map = model->map,
+        .model_size = model->size,
+        .layer = il + 1,
+        .n_total_expert = DS4_N_EXPERT,
+        .gate_offset = ln->ffn_gate_exps->abs_offset,
+        .up_offset = ln->ffn_up_exps->abs_offset,
+        .down_offset = ln->ffn_down_exps->abs_offset,
+        .gate_expert_bytes = gate_out * gate_row,
+        .down_expert_bytes = down_out * down_row,
+    };
+    (void)ds4_gpu_stream_expert_cache_prefetch(&table,
+                                               g->prefetch_selected,
+                                               DS4_N_EXPERT_USED);
+}
+
 static bool glm_graph_encode_sparse_ffn_one(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -28308,6 +28397,10 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          1,
                                          stage_t0);
     if (ok) ok = glm_graph_profile_router_selection(g, l, il, pos);
+    /* Fire next-layer expert prefetch before this layer's demand load: the
+     * ring interleaves both, the drive stays saturated, and predictions get
+     * the whole demand-load window plus this layer's compute to land. */
+    if (ok) glm_graph_prefetch_next_layer_experts(g, model, il, ffn_norm);
     const bool resident_decode_layer =
         g->ssd_streaming && glm_stream_resident_decode_layer_enabled(l, il);
     const bool generic_streaming_selected_cache =

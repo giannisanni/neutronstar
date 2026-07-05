@@ -2256,10 +2256,28 @@ typedef struct {
     uint64_t offset;
     uint64_t bytes;
     uint64_t age;
+    uint64_t uses; /* hit count; eviction is least-frequently-used, age breaks ties */
     void *buf;
     uint32_t payload_off; /* payload start inside buf (O_DIRECT-aligned reads) */
+    uint8_t aligned_buf;  /* buf belongs to the aligned recycling pool */
     int valid;
 } cuda_host_cache_slot;
+
+/* Forward decl: pool release lives with the fetch machinery below. */
+static void cuda_fetch_buf_put(void *ptr, uint64_t size);
+
+static void cuda_host_cache_release_buf(cuda_host_cache_slot *s) {
+    if (!s->buf) return;
+    if (s->aligned_buf) {
+        const uint64_t a = g_model_direct_align > 1 ? g_model_direct_align : 4096;
+        const uint64_t alloc =
+            ((s->payload_off + s->bytes + a - 1u) / a) * a;
+        cuda_fetch_buf_put(s->buf, alloc);
+    } else {
+        free(s->buf);
+    }
+    s->buf = NULL;
+}
 
 static cuda_host_cache_slot *g_host_cache_slots;
 static uint32_t g_host_cache_nslots;
@@ -2319,6 +2337,7 @@ static const void *cuda_host_cache_get(uint64_t offset, uint64_t bytes) {
             &g_host_cache_slots[(h + i) % g_host_cache_nslots];
         if (s->valid && s->offset == offset && s->bytes == bytes) {
             s->age = ++g_host_cache_tick;
+            s->uses++;
             g_host_cache_hits++;
             cuda_host_cache_report();
             return (const char *)s->buf + s->payload_off;
@@ -2329,19 +2348,46 @@ static const void *cuda_host_cache_get(uint64_t offset, uint64_t bytes) {
     return NULL;
 }
 
+/* Quiet membership probe: no hit/miss accounting, no LRU/LFU bump. Used by
+ * the speculative prefetcher to skip experts that are already resident. */
+static int cuda_host_cache_contains(uint64_t offset, uint64_t bytes) {
+    if (g_host_cache_nslots == 0) return 0;
+    const uint32_t h = cuda_host_cache_bucket(offset);
+    for (uint32_t i = 0; i < CUDA_HOST_CACHE_WAYS; i++) {
+        const cuda_host_cache_slot *s =
+            &g_host_cache_slots[(h + i) % g_host_cache_nslots];
+        if (s->valid && s->offset == offset && s->bytes == bytes) return 1;
+    }
+    return 0;
+}
+
+static uint64_t g_host_cache_inserts;
+
 /* Takes ownership of buf; frees it if not inserted. The payload (bytes long)
  * starts at buf + payload_off, which is nonzero for O_DIRECT-aligned reads. */
 static void cuda_host_cache_insert_owned(uint64_t offset,
                                          uint64_t bytes,
                                          void *buf,
-                                         uint32_t payload_off) {
+                                         uint32_t payload_off,
+                                         int aligned_buf) {
+    cuda_host_cache_slot incoming;
+    incoming.buf = buf;
+    incoming.bytes = bytes;
+    incoming.payload_off = payload_off;
+    incoming.aligned_buf = (uint8_t)(aligned_buf != 0);
     if (g_host_cache_nslots == 0 || !buf) {
-        free(buf);
+        cuda_host_cache_release_buf(&incoming);
         return;
+    }
+    /* Periodic decay so once-hot entries cannot squat forever. */
+    if ((++g_host_cache_inserts & 4095u) == 0) {
+        for (uint32_t i = 0; i < g_host_cache_nslots; i++) {
+            g_host_cache_slots[i].uses >>= 1;
+        }
     }
     const uint32_t h = cuda_host_cache_bucket(offset);
     cuda_host_cache_slot *victim = NULL;   /* empty slot if available */
-    cuda_host_cache_slot *lru = NULL;      /* oldest valid entry in window */
+    cuda_host_cache_slot *lfu = NULL;      /* least-used valid entry in window */
     for (uint32_t i = 0; i < CUDA_HOST_CACHE_WAYS; i++) {
         cuda_host_cache_slot *s =
             &g_host_cache_slots[(h + i) % g_host_cache_nslots];
@@ -2350,38 +2396,45 @@ static void cuda_host_cache_insert_owned(uint64_t offset,
             continue;
         }
         if (s->offset == offset && s->bytes == bytes) {
-            free(buf); /* raced with an earlier insert of the same range */
+            /* raced with an earlier insert of the same range */
+            cuda_host_cache_release_buf(&incoming);
             return;
         }
-        if (!lru || s->age < lru->age) lru = s;
+        if (!lfu || s->uses < lfu->uses ||
+            (s->uses == lfu->uses && s->age < lfu->age)) {
+            lfu = s;
+        }
     }
-    /* Under budget pressure, replace the window's LRU even when an empty
-     * slot exists: with large entries the budget fills long before the
-     * table does, and refusing inserts would freeze the cache contents. */
-    if (g_host_cache_used + bytes > g_host_cache_budget && lru) {
-        victim = lru;
+    /* Under budget pressure, replace the window's least-used entry even when
+     * an empty slot exists: with large entries the budget fills long before
+     * the table does, and refusing inserts would freeze the cache contents.
+     * Frequency-weighted eviction protects repeatedly hit experts from being
+     * flushed by one-shot streams (pure LRU thrashes at these cache sizes). */
+    if (g_host_cache_used + bytes > g_host_cache_budget && lfu) {
+        victim = lfu;
     } else if (!victim) {
-        victim = lru;
+        victim = lfu;
     }
     if (!victim) {
-        free(buf);
+        cuda_host_cache_release_buf(&incoming);
         return;
     }
     if (victim->valid) {
         g_host_cache_used -= victim->bytes;
-        free(victim->buf);
+        cuda_host_cache_release_buf(victim);
         victim->valid = 0;
-        victim->buf = NULL;
     }
     if (g_host_cache_used + bytes > g_host_cache_budget) {
-        free(buf); /* window had nothing to reclaim */
+        cuda_host_cache_release_buf(&incoming); /* window had nothing to reclaim */
         return;
     }
     victim->offset = offset;
     victim->bytes = bytes;
     victim->age = ++g_host_cache_tick;
+    victim->uses = 1;
     victim->buf = buf;
     victim->payload_off = payload_off;
+    victim->aligned_buf = incoming.aligned_buf;
     victim->valid = 1;
     g_host_cache_used += bytes;
 }
@@ -2396,6 +2449,7 @@ static void cuda_host_cache_insert_owned(uint64_t offset,
  * ponytail: one-shot pthreads per layer batch and pageable upload buffers;
  * persistent pool + pinned ring if profiling ever shows they matter. */
 typedef struct {
+    int kind;               /* 0 = demand fetch, 1 = speculative prefetch */
     char *dst;
     uint64_t offset;
     uint64_t bytes;
@@ -2416,7 +2470,51 @@ typedef struct {
     uint64_t read_done;
     uint32_t payload_off;
     int read_fd;
+    int aligned_alloc; /* buffer came from the aligned recycling pool */
 } cuda_fetch_job;
+
+/* Recycling pool for the O_DIRECT-aligned read buffers. posix_memalign at
+ * ~3MB goes through mmap, so per-read alloc/free costs two page-table
+ * syscalls with TLB shootdowns per expert part; recycling makes buffer
+ * turnover free. Single-threaded like the rest of the streaming globals. */
+#define CUDA_FETCH_BUF_POOL_MAX 96
+static struct { void *ptr; uint64_t size; } g_fetch_buf_pool[CUDA_FETCH_BUF_POOL_MAX];
+static uint32_t g_fetch_buf_pool_n;
+
+static void *cuda_fetch_buf_get(uint64_t size, uint64_t align) {
+    for (uint32_t i = g_fetch_buf_pool_n; i-- > 0;) {
+        if (g_fetch_buf_pool[i].size == size) {
+            void *p = g_fetch_buf_pool[i].ptr;
+            g_fetch_buf_pool[i] = g_fetch_buf_pool[--g_fetch_buf_pool_n];
+            return p;
+        }
+    }
+    void *p = NULL;
+    if (posix_memalign(&p, (size_t)align, (size_t)size) != 0) return NULL;
+    return p;
+}
+
+static void cuda_fetch_buf_put(void *ptr, uint64_t size) {
+    if (!ptr) return;
+    if (g_fetch_buf_pool_n < CUDA_FETCH_BUF_POOL_MAX) {
+        g_fetch_buf_pool[g_fetch_buf_pool_n].ptr = ptr;
+        g_fetch_buf_pool[g_fetch_buf_pool_n].size = size;
+        g_fetch_buf_pool_n++;
+        return;
+    }
+    free(ptr);
+}
+
+/* Release a fetch job's buffer to the right place. */
+static void cuda_fetch_job_release_buf(cuda_fetch_job *job) {
+    if (!job->host_buf) return;
+    if (job->aligned_alloc) {
+        cuda_fetch_buf_put(job->host_buf, job->read_len);
+    } else {
+        free(job->host_buf);
+    }
+    job->host_buf = NULL;
+}
 
 typedef struct {
     cuda_fetch_job *jobs;
@@ -2596,13 +2694,14 @@ static int cuda_fetch_job_prepare_read(cuda_fetch_job *job) {
         if (aligned_off <= g_model_file_size &&
             read_len <= g_model_file_size - aligned_off &&
             payload <= UINT32_MAX) {
-            void *buf = NULL;
-            if (posix_memalign(&buf, (size_t)a, (size_t)read_len) == 0) {
+            void *buf = cuda_fetch_buf_get(read_len, a);
+            if (buf) {
                 job->host_buf = buf;
                 job->read_fd = g_model_direct_fd;
                 job->aligned_off = aligned_off;
                 job->read_len = read_len;
                 job->payload_off = (uint32_t)payload;
+                job->aligned_alloc = 1;
                 return 1;
             }
         }
@@ -2613,76 +2712,173 @@ static int cuda_fetch_job_prepare_read(cuda_fetch_job *job) {
     job->read_fd = job->fd;
     job->aligned_off = job->offset;
     job->read_len = job->bytes;
+    job->aligned_alloc = 0;
     return 1;
 }
 
 #if defined(__linux__) && defined(DS4_USE_IO_URING)
+/* Speculative prefetch pool: jobs launched from next-layer router predictions.
+ * Completions land in the host expert cache; slots recycle on completion. */
+#define CUDA_PREFETCH_SLOTS 48
+static cuda_fetch_job g_prefetch_jobs[CUDA_PREFETCH_SLOTS];
+static int g_prefetch_busy[CUDA_PREFETCH_SLOTS];
+static uint64_t g_prefetch_submitted;
+static uint64_t g_prefetch_completed;
+static unsigned g_fetch_uring_inflight; /* SQEs handed to the kernel, not yet reaped */
+
+static int cuda_uring_submit_job(cuda_fetch_job *job) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&g_fetch_uring);
+    if (!sqe) {
+        (void)io_uring_submit(&g_fetch_uring);
+        sqe = io_uring_get_sqe(&g_fetch_uring);
+        if (!sqe) return 0;
+    }
+    io_uring_prep_read(sqe, job->read_fd,
+                       (char *)job->host_buf + job->read_done,
+                       (unsigned)(job->read_len - job->read_done),
+                       (off_t)(job->aligned_off + job->read_done));
+    io_uring_sqe_set_data(sqe, job);
+    g_fetch_uring_inflight++;
+    return 1;
+}
+
+/* Shared completion handler for demand and prefetch jobs.
+ * Returns 1 when the job left the ring (done or failed), 0 if resubmitted. */
+static int cuda_uring_handle_cqe(cuda_fetch_job *job, int res) {
+    int finished = 0;
+    if (res == -EINTR || res == -EAGAIN) {
+        /* transient: resubmit the same range */
+    } else if (res <= 0) {
+        cuda_fetch_job_release_buf(job);
+        finished = 1;
+    } else {
+        job->read_done += (uint64_t)res;
+        if (job->read_done >= job->read_len) {
+            job->ok = 1;
+            finished = 1;
+        }
+    }
+    if (!finished && !cuda_uring_submit_job(job)) {
+        cuda_fetch_job_release_buf(job);
+        finished = 1;
+    }
+    if (finished && job->kind == 1) {
+        /* prefetch: donate a successful read to the host expert cache */
+        if (job->ok && job->host_buf) {
+            cuda_host_cache_insert_owned(cuda_fetch_cache_key(job),
+                                         job->bytes,
+                                         job->host_buf,
+                                         job->payload_off,
+                                         job->aligned_alloc);
+            job->host_buf = NULL;
+            g_prefetch_completed++;
+        }
+        g_prefetch_busy[job - g_prefetch_jobs] = 0;
+    }
+    return finished;
+}
+
+/* Block until a matching in-flight prefetch lands (or fails), then return
+ * the cached payload if it made it into the host cache. Runs only from the
+ * demand pre-pass, before any demand submissions, so every reaped CQE is a
+ * prefetch completion. Returns NULL when there is nothing to wait for. */
+static const void *cuda_prefetch_wait_for(uint64_t offset, uint64_t bytes) {
+    if (g_fetch_uring_state != 1) return NULL;
+    int slot = -1;
+    for (int s = 0; s < CUDA_PREFETCH_SLOTS; s++) {
+        if (g_prefetch_busy[s] &&
+            g_prefetch_jobs[s].offset == offset &&
+            g_prefetch_jobs[s].bytes == bytes) {
+            slot = s;
+            break;
+        }
+    }
+    if (slot < 0) return NULL;
+    while (g_prefetch_busy[slot]) {
+        (void)io_uring_submit(&g_fetch_uring);
+        struct io_uring_cqe *cqe = NULL;
+        if (io_uring_wait_cqe(&g_fetch_uring, &cqe) < 0) {
+            if (errno == EINTR) continue;
+            return NULL;
+        }
+        cuda_fetch_job *job = (cuda_fetch_job *)io_uring_cqe_get_data(cqe);
+        const int res = cqe->res;
+        io_uring_cqe_seen(&g_fetch_uring, cqe);
+        if (g_fetch_uring_inflight) g_fetch_uring_inflight--;
+        (void)cuda_uring_handle_cqe(job, res);
+    }
+    return cuda_host_cache_get(offset, bytes);
+}
+
+/* Drain finished CQEs without blocking. Prefetch completions are absorbed
+ * here; demand jobs are never outstanding when this runs from the prefetch
+ * or pre-pass entry points, so nothing else consumes them. */
+static void cuda_fetch_uring_reap_nowait(void) {
+    if (g_fetch_uring_state != 1) return;
+    struct io_uring_cqe *cqe = NULL;
+    while (io_uring_peek_cqe(&g_fetch_uring, &cqe) == 0 && cqe) {
+        cuda_fetch_job *job = (cuda_fetch_job *)io_uring_cqe_get_data(cqe);
+        const int res = cqe->res;
+        io_uring_cqe_seen(&g_fetch_uring, cqe);
+        if (g_fetch_uring_inflight) g_fetch_uring_inflight--;
+        (void)cuda_uring_handle_cqe(job, res);
+    }
+    (void)io_uring_submit(&g_fetch_uring); /* flush any resubmitted SQEs */
+}
+
 /* Run all disk jobs through the ring with a sliding submission window.
  * Short reads (O_DIRECT completes in block multiples) are resubmitted for
- * the remainder. Failed jobs keep ok=0 and are reported by the caller. */
+ * the remainder. Failed jobs keep ok=0 and are reported by the caller.
+ * Prefetch completions arriving mid-drain are absorbed by the handler. */
 static void cuda_fetch_uring_execute(cuda_fetch_job *jobs, uint32_t njobs) {
     uint32_t next = 0;
-    unsigned inflight = 0;
     uint32_t remaining = 0;
     for (uint32_t i = 0; i < njobs; i++) {
         if (jobs[i].need_disk && jobs[i].host_buf) remaining++;
     }
     while (remaining != 0) {
-        while (inflight < g_fetch_uring_qd && next < njobs) {
+        unsigned queued = 0;
+        while (next < njobs) {
             cuda_fetch_job *job = &jobs[next];
+            if (!job->need_disk || !job->host_buf || job->ok) {
+                next++;
+                continue;
+            }
+            if (!cuda_uring_submit_job(job)) break;
             next++;
-            if (!job->need_disk || !job->host_buf) continue;
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&g_fetch_uring);
-            if (!sqe) break;
-            io_uring_prep_read(sqe, job->read_fd,
-                               (char *)job->host_buf + job->read_done,
-                               (unsigned)(job->read_len - job->read_done),
-                               (off_t)(job->aligned_off + job->read_done));
-            io_uring_sqe_set_data(sqe, job);
-            inflight++;
+            queued++;
+            if (queued >= g_fetch_uring_qd) break;
         }
-        if (inflight == 0) break; /* nothing submittable: fail remaining */
-        if (io_uring_submit_and_wait(&g_fetch_uring, 1) < 0) break;
+        const int wait_rc = io_uring_submit_and_wait(&g_fetch_uring, 1);
+        if (wait_rc < 0 && wait_rc != -EINTR) break;
         struct io_uring_cqe *cqe = NULL;
+        int progressed = 0;
         while (io_uring_peek_cqe(&g_fetch_uring, &cqe) == 0 && cqe) {
             cuda_fetch_job *job = (cuda_fetch_job *)io_uring_cqe_get_data(cqe);
             const int res = cqe->res;
             io_uring_cqe_seen(&g_fetch_uring, cqe);
-            inflight--;
-            if (res == -EINTR || res == -EAGAIN) {
-                /* transient: resubmit the same range */
-            } else if (res <= 0) {
-                free(job->host_buf);
-                job->host_buf = NULL;
+            if (g_fetch_uring_inflight) g_fetch_uring_inflight--;
+            progressed = 1;
+            if (cuda_uring_handle_cqe(job, res) && job->kind == 0) {
                 remaining--;
-                continue;
-            } else {
-                job->read_done += (uint64_t)res;
-                if (job->read_done >= job->read_len) {
-                    job->ok = 1;
-                    remaining--;
-                    continue;
-                }
             }
-            /* resubmit remainder */
-            struct io_uring_sqe *sqe = io_uring_get_sqe(&g_fetch_uring);
-            if (!sqe) {
-                (void)io_uring_submit(&g_fetch_uring);
-                sqe = io_uring_get_sqe(&g_fetch_uring);
-            }
-            if (!sqe) {
-                free(job->host_buf);
-                job->host_buf = NULL;
-                remaining--;
-                continue;
-            }
-            io_uring_prep_read(sqe, job->read_fd,
-                               (char *)job->host_buf + job->read_done,
-                               (unsigned)(job->read_len - job->read_done),
-                               (off_t)(job->aligned_off + job->read_done));
-            io_uring_sqe_set_data(sqe, job);
-            inflight++;
         }
+        if (!progressed && queued == 0 && g_fetch_uring_inflight == 0) break;
+    }
+    /* Never leave with the kernel still writing into job buffers the caller
+     * may free: drain every outstanding CQE before returning. */
+    while (g_fetch_uring_inflight != 0) {
+        (void)io_uring_submit(&g_fetch_uring); /* flush resubmitted SQEs */
+        struct io_uring_cqe *cqe = NULL;
+        if (io_uring_wait_cqe(&g_fetch_uring, &cqe) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        cuda_fetch_job *job = (cuda_fetch_job *)io_uring_cqe_get_data(cqe);
+        const int res = cqe->res;
+        io_uring_cqe_seen(&g_fetch_uring, cqe);
+        g_fetch_uring_inflight--;
+        (void)cuda_uring_handle_cqe(job, res);
     }
 }
 #endif
@@ -2725,12 +2921,22 @@ static int cuda_fetch_execute(cuda_fetch_job *jobs, uint32_t njobs) {
         }
     }
     cuda_host_cache_init();
+#if defined(__linux__) && defined(DS4_USE_IO_URING)
+    if (g_fetch_uring_state == 1) cuda_fetch_uring_reap_nowait();
+#endif
 
     uint32_t disk_jobs = 0;
     for (uint32_t i = 0; i < njobs; i++) {
         cuda_fetch_job *job = &jobs[i];
         const void *cached = cuda_host_cache_get(cuda_fetch_cache_key(job),
                                                  job->bytes);
+#if defined(__linux__) && defined(DS4_USE_IO_URING)
+        if (!cached && job->fd == g_model_fd) {
+            /* a speculative prefetch may already be reading this range:
+             * wait for it instead of issuing a duplicate disk read */
+            cached = cuda_prefetch_wait_for(job->offset, job->bytes);
+        }
+#endif
         if (cached) {
             if (!cuda_fetch_upload(job, cached)) return 0;
             job->ok = 1;
@@ -2790,7 +2996,8 @@ static int cuda_fetch_execute(cuda_fetch_job *jobs, uint32_t njobs) {
         if (jobs[i].need_disk && jobs[i].ok && jobs[i].host_buf) {
             cuda_host_cache_insert_owned(cuda_fetch_cache_key(&jobs[i]),
                                          jobs[i].bytes, jobs[i].host_buf,
-                                         jobs[i].payload_off);
+                                         jobs[i].payload_off,
+                                         jobs[i].aligned_alloc);
             jobs[i].host_buf = NULL;
         }
     }
@@ -2799,8 +3006,7 @@ static int cuda_fetch_execute(cuda_fetch_job *jobs, uint32_t njobs) {
 fail:
     (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
     for (uint32_t i = 0; i < njobs; i++) {
-        free(jobs[i].host_buf);
-        jobs[i].host_buf = NULL;
+        cuda_fetch_job_release_buf(&jobs[i]);
     }
     return 0;
 }
@@ -2922,7 +3128,7 @@ static int cuda_model_copy_to_device_streamed(
         free(capture);
         return 0;
     }
-    if (capture) cuda_host_cache_insert_owned(offset, bytes, capture, 0);
+    if (capture) cuda_host_cache_insert_owned(offset, bytes, capture, 0, 0);
     return 1;
 }
 
@@ -3911,6 +4117,96 @@ static int cuda_stream_selected_cache_begin_compact_load(
                 (double)compact_gate_bytes / 1048576.0,
                 (double)compact_down_bytes / 1048576.0);
     }
+    return 1;
+}
+
+/* Speculative prefetch: read predicted next-layer experts into the host
+ * expert cache so the coming selected load turns misses into RAM hits.
+ * Predictions come from running layer N+1's router on layer N's hidden
+ * state (cross-layer gate approximation); mispredicts only cost idle disk
+ * bandwidth. Fire-and-forget: completions are reaped opportunistically at
+ * the next prefetch call or demand fetch. io_uring builds only; a no-op
+ * elsewhere. Keys use raw model offsets, so runs using an expert bundle
+ * sidecar get no benefit (harmless). */
+extern "C" int ds4_gpu_stream_expert_cache_prefetch(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_selected) {
+#if defined(__linux__) && defined(DS4_USE_IO_URING)
+    if (!g_ssd_streaming_mode || !table || !selected ||
+        n_selected == 0 || n_selected > 8u) return 1;
+    if (g_model_fd < 0) return 1;
+    if (!cuda_fetch_uring_ready()) return 1;
+    cuda_host_cache_init();
+    if (g_host_cache_nslots == 0) return 1; /* nowhere for reads to land */
+    cuda_fetch_uring_reap_nowait();
+    int32_t ids[8];
+    if (!ds4_gpu_tensor_read(selected, 0, ids,
+                             (uint64_t)n_selected * sizeof(ids[0]))) {
+        return 1;
+    }
+    unsigned queued = 0;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        if (ids[i] < 0 || (uint32_t)ids[i] >= table->n_total_expert) continue;
+        const uint64_t expert = (uint64_t)(uint32_t)ids[i];
+        const uint64_t offs[3] = {
+            table->gate_offset + expert * table->gate_expert_bytes,
+            table->up_offset + expert * table->gate_expert_bytes,
+            table->down_offset + expert * table->down_expert_bytes,
+        };
+        const uint64_t lens[3] = {
+            table->gate_expert_bytes,
+            table->gate_expert_bytes,
+            table->down_expert_bytes,
+        };
+        for (int p = 0; p < 3; p++) {
+            if (lens[p] == 0 || offs[p] > table->model_size ||
+                lens[p] > table->model_size - offs[p]) {
+                continue;
+            }
+            if (cuda_host_cache_contains(offs[p], lens[p])) continue;
+            int dup = 0;
+            int free_slot = -1;
+            for (int s = 0; s < CUDA_PREFETCH_SLOTS; s++) {
+                if (g_prefetch_busy[s]) {
+                    if (g_prefetch_jobs[s].offset == offs[p]) { dup = 1; break; }
+                } else if (free_slot < 0) {
+                    free_slot = s;
+                }
+            }
+            if (dup || free_slot < 0) continue;
+            cuda_fetch_job *job = &g_prefetch_jobs[free_slot];
+            memset(job, 0, sizeof(*job));
+            job->kind = 1;
+            job->fd = g_model_fd;
+            job->offset = offs[p];
+            job->bytes = lens[p];
+            job->need_disk = 1;
+            if (!cuda_fetch_job_prepare_read(job)) continue;
+            if (!cuda_uring_submit_job(job)) {
+                free(job->host_buf);
+                job->host_buf = NULL;
+                continue;
+            }
+            g_prefetch_busy[free_slot] = 1;
+            g_prefetch_submitted++;
+            queued++;
+        }
+    }
+    if (queued != 0) (void)io_uring_submit(&g_fetch_uring);
+    if (queued != 0 && getenv("DS4_CUDA_PREFETCH_VERBOSE")) {
+        fprintf(stderr,
+                "ds4: expert prefetch layer=%u queued=%u submitted=%llu landed=%llu\n",
+                table->layer,
+                queued,
+                (unsigned long long)g_prefetch_submitted,
+                (unsigned long long)g_prefetch_completed);
+    }
+#else
+    (void)table;
+    (void)selected;
+    (void)n_selected;
+#endif
     return 1;
 }
 
