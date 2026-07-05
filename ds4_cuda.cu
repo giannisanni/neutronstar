@@ -18,6 +18,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__linux__) && defined(DS4_USE_IO_URING)
+#include <liburing.h>
+#endif
+
 /* CUDA < 12.2 lacks the cudaMemLocation overloads of cudaMemAdvise() and
  * cudaMemPrefetchAsync(). Forward to the legacy int-device signatures. */
 #if CUDART_VERSION < 12020
@@ -2253,6 +2257,7 @@ typedef struct {
     uint64_t bytes;
     uint64_t age;
     void *buf;
+    uint32_t payload_off; /* payload start inside buf (O_DIRECT-aligned reads) */
     int valid;
 } cuda_host_cache_slot;
 
@@ -2316,7 +2321,7 @@ static const void *cuda_host_cache_get(uint64_t offset, uint64_t bytes) {
             s->age = ++g_host_cache_tick;
             g_host_cache_hits++;
             cuda_host_cache_report();
-            return s->buf;
+            return (const char *)s->buf + s->payload_off;
         }
     }
     g_host_cache_misses++;
@@ -2324,10 +2329,12 @@ static const void *cuda_host_cache_get(uint64_t offset, uint64_t bytes) {
     return NULL;
 }
 
-/* Takes ownership of buf (malloc'd, bytes long); frees it if not inserted. */
+/* Takes ownership of buf; frees it if not inserted. The payload (bytes long)
+ * starts at buf + payload_off, which is nonzero for O_DIRECT-aligned reads. */
 static void cuda_host_cache_insert_owned(uint64_t offset,
                                          uint64_t bytes,
-                                         void *buf) {
+                                         void *buf,
+                                         uint32_t payload_off) {
     if (g_host_cache_nslots == 0 || !buf) {
         free(buf);
         return;
@@ -2374,6 +2381,7 @@ static void cuda_host_cache_insert_owned(uint64_t offset,
     victim->bytes = bytes;
     victim->age = ++g_host_cache_tick;
     victim->buf = buf;
+    victim->payload_off = payload_off;
     victim->valid = 1;
     g_host_cache_used += bytes;
 }
@@ -2400,6 +2408,14 @@ typedef struct {
     char *dst_down;
     uint64_t part_gate;
     uint64_t part_down;
+    /* O_DIRECT-aligned read bracket (io_uring path): read read_len bytes at
+     * aligned_off into host_buf; the payload starts at host_buf+payload_off.
+     * The pthread fallback reads buffered and leaves payload_off at 0. */
+    uint64_t aligned_off;
+    uint64_t read_len;
+    uint64_t read_done;
+    uint32_t payload_off;
+    int read_fd;
 } cuda_fetch_job;
 
 typedef struct {
@@ -2493,7 +2509,7 @@ static int cuda_parallel_fetch_threads(void) {
     const char *env = getenv("DS4_CUDA_PARALLEL_FETCH_THREADS");
     if (env && env[0]) {
         int v = atoi(env);
-        if (v > 0) cached = v > 16 ? 16 : v;
+        if (v > 0) cached = v > 64 ? 64 : v;
     }
     return cached;
 }
@@ -2529,6 +2545,147 @@ static uint64_t cuda_fetch_cache_key(const cuda_fetch_job *job) {
     return job->fd == g_bundle_fd ? (job->offset | CUDA_BUNDLE_CACHE_KEY_BIT)
                                   : job->offset;
 }
+
+/* io_uring fetch engine.  Replaces the one-shot pthread pool with async
+ * submission at real queue depth, reading through the O_DIRECT fd with
+ * aligned brackets (same trick as cuda_model_stage_read) so misses bypass
+ * the page cache instead of churning it.  Enabled when built with
+ * DS4_USE_IO_URING and the ring initializes; DS4_CUDA_FETCH_URING=0 falls
+ * back to the pthread pool, DS4_CUDA_FETCH_URING_QD sets queue depth. */
+#if defined(__linux__) && defined(DS4_USE_IO_URING)
+static struct io_uring g_fetch_uring;
+static int g_fetch_uring_state = -1; /* -1 unchecked, 0 off, 1 ready */
+static unsigned g_fetch_uring_qd = 64;
+
+static int cuda_fetch_uring_ready(void) {
+    if (g_fetch_uring_state >= 0) return g_fetch_uring_state;
+    g_fetch_uring_state = 0;
+    const char *env = getenv("DS4_CUDA_FETCH_URING");
+    if (env && env[0] == '0') return 0;
+    const char *qd_env = getenv("DS4_CUDA_FETCH_URING_QD");
+    if (qd_env && qd_env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(qd_env, &end, 10);
+        if (end != qd_env && v >= 8 && v <= 512) g_fetch_uring_qd = (unsigned)v;
+    }
+    if (io_uring_queue_init(g_fetch_uring_qd, &g_fetch_uring, 0) != 0) {
+        fprintf(stderr, "ds4: CUDA fetch io_uring init failed (%s); using thread pool\n",
+                strerror(errno));
+        return 0;
+    }
+    fprintf(stderr, "ds4: CUDA fetch io_uring enabled (queue depth %u)\n",
+            g_fetch_uring_qd);
+    g_fetch_uring_state = 1;
+    return 1;
+}
+#endif
+
+/* Pick the read strategy for one disk job: an O_DIRECT-aligned bracket on
+ * the direct fd when the job targets the model file, else a plain buffered
+ * read. Allocates host_buf; returns 0 on allocation/geometry failure. */
+static int cuda_fetch_job_prepare_read(cuda_fetch_job *job) {
+    job->read_done = 0;
+    job->payload_off = 0;
+#if defined(__linux__) && defined(O_DIRECT)
+    if (job->fd == g_model_fd && g_model_direct_fd >= 0 &&
+        g_model_direct_align > 1 && g_model_file_size != 0) {
+        const uint64_t a = g_model_direct_align;
+        const uint64_t aligned_off = job->offset & ~(a - 1u);
+        const uint64_t payload = job->offset - aligned_off;
+        uint64_t read_len = ((payload + job->bytes + a - 1u) / a) * a;
+        if (aligned_off <= g_model_file_size &&
+            read_len <= g_model_file_size - aligned_off &&
+            payload <= UINT32_MAX) {
+            void *buf = NULL;
+            if (posix_memalign(&buf, (size_t)a, (size_t)read_len) == 0) {
+                job->host_buf = buf;
+                job->read_fd = g_model_direct_fd;
+                job->aligned_off = aligned_off;
+                job->read_len = read_len;
+                job->payload_off = (uint32_t)payload;
+                return 1;
+            }
+        }
+    }
+#endif
+    job->host_buf = malloc((size_t)job->bytes);
+    if (!job->host_buf) return 0;
+    job->read_fd = job->fd;
+    job->aligned_off = job->offset;
+    job->read_len = job->bytes;
+    return 1;
+}
+
+#if defined(__linux__) && defined(DS4_USE_IO_URING)
+/* Run all disk jobs through the ring with a sliding submission window.
+ * Short reads (O_DIRECT completes in block multiples) are resubmitted for
+ * the remainder. Failed jobs keep ok=0 and are reported by the caller. */
+static void cuda_fetch_uring_execute(cuda_fetch_job *jobs, uint32_t njobs) {
+    uint32_t next = 0;
+    unsigned inflight = 0;
+    uint32_t remaining = 0;
+    for (uint32_t i = 0; i < njobs; i++) {
+        if (jobs[i].need_disk && jobs[i].host_buf) remaining++;
+    }
+    while (remaining != 0) {
+        while (inflight < g_fetch_uring_qd && next < njobs) {
+            cuda_fetch_job *job = &jobs[next];
+            next++;
+            if (!job->need_disk || !job->host_buf) continue;
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&g_fetch_uring);
+            if (!sqe) break;
+            io_uring_prep_read(sqe, job->read_fd,
+                               (char *)job->host_buf + job->read_done,
+                               (unsigned)(job->read_len - job->read_done),
+                               (off_t)(job->aligned_off + job->read_done));
+            io_uring_sqe_set_data(sqe, job);
+            inflight++;
+        }
+        if (inflight == 0) break; /* nothing submittable: fail remaining */
+        if (io_uring_submit_and_wait(&g_fetch_uring, 1) < 0) break;
+        struct io_uring_cqe *cqe = NULL;
+        while (io_uring_peek_cqe(&g_fetch_uring, &cqe) == 0 && cqe) {
+            cuda_fetch_job *job = (cuda_fetch_job *)io_uring_cqe_get_data(cqe);
+            const int res = cqe->res;
+            io_uring_cqe_seen(&g_fetch_uring, cqe);
+            inflight--;
+            if (res == -EINTR || res == -EAGAIN) {
+                /* transient: resubmit the same range */
+            } else if (res <= 0) {
+                free(job->host_buf);
+                job->host_buf = NULL;
+                remaining--;
+                continue;
+            } else {
+                job->read_done += (uint64_t)res;
+                if (job->read_done >= job->read_len) {
+                    job->ok = 1;
+                    remaining--;
+                    continue;
+                }
+            }
+            /* resubmit remainder */
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&g_fetch_uring);
+            if (!sqe) {
+                (void)io_uring_submit(&g_fetch_uring);
+                sqe = io_uring_get_sqe(&g_fetch_uring);
+            }
+            if (!sqe) {
+                free(job->host_buf);
+                job->host_buf = NULL;
+                remaining--;
+                continue;
+            }
+            io_uring_prep_read(sqe, job->read_fd,
+                               (char *)job->host_buf + job->read_done,
+                               (unsigned)(job->read_len - job->read_done),
+                               (off_t)(job->aligned_off + job->read_done));
+            io_uring_sqe_set_data(sqe, job);
+            inflight++;
+        }
+    }
+}
+#endif
 
 /* Upload a job's payload to its device destination(s) on the shared stream.
  * Bundle jobs fan one contiguous expert out to gate/up/down. */
@@ -2584,20 +2741,33 @@ static int cuda_fetch_execute(cuda_fetch_job *jobs, uint32_t njobs) {
     }
 
     if (disk_jobs != 0) {
-        cuda_fetch_pool pool;
-        pool.jobs = jobs;
-        pool.njobs = njobs;
-        pool.next = 0;
-        int nthreads = cuda_parallel_fetch_threads();
-        if ((uint32_t)nthreads > disk_jobs) nthreads = (int)disk_jobs;
-        pthread_t tids[16];
-        int spawned = 0;
-        for (int t = 0; t < nthreads; t++) {
-            if (pthread_create(&tids[t], NULL, cuda_fetch_worker, &pool) != 0) break;
-            spawned++;
+        int ran_uring = 0;
+#if defined(__linux__) && defined(DS4_USE_IO_URING)
+        if (cuda_fetch_uring_ready()) {
+            ran_uring = 1;
+            for (uint32_t i = 0; i < njobs; i++) {
+                cuda_fetch_job *job = &jobs[i];
+                if (job->need_disk) (void)cuda_fetch_job_prepare_read(job);
+            }
+            cuda_fetch_uring_execute(jobs, njobs);
         }
-        if (spawned == 0) cuda_fetch_worker(&pool); /* degraded: run inline */
-        for (int t = 0; t < spawned; t++) pthread_join(tids[t], NULL);
+#endif
+        if (!ran_uring) {
+            cuda_fetch_pool pool;
+            pool.jobs = jobs;
+            pool.njobs = njobs;
+            pool.next = 0;
+            int nthreads = cuda_parallel_fetch_threads();
+            if ((uint32_t)nthreads > disk_jobs) nthreads = (int)disk_jobs;
+            pthread_t tids[64];
+            int spawned = 0;
+            for (int t = 0; t < nthreads; t++) {
+                if (pthread_create(&tids[t], NULL, cuda_fetch_worker, &pool) != 0) break;
+                spawned++;
+            }
+            if (spawned == 0) cuda_fetch_worker(&pool); /* degraded: run inline */
+            for (int t = 0; t < spawned; t++) pthread_join(tids[t], NULL);
+        }
 
         for (uint32_t i = 0; i < njobs; i++) {
             cuda_fetch_job *job = &jobs[i];
@@ -2608,7 +2778,7 @@ static int cuda_fetch_execute(cuda_fetch_job *jobs, uint32_t njobs) {
                         (double)job->offset / 1073741824.0);
                 goto fail;
             }
-            if (!cuda_fetch_upload(job, job->host_buf)) goto fail;
+            if (!cuda_fetch_upload(job, (const char *)job->host_buf + job->payload_off)) goto fail;
         }
     }
 
@@ -2619,7 +2789,8 @@ static int cuda_fetch_execute(cuda_fetch_job *jobs, uint32_t njobs) {
     for (uint32_t i = 0; i < njobs; i++) {
         if (jobs[i].need_disk && jobs[i].ok && jobs[i].host_buf) {
             cuda_host_cache_insert_owned(cuda_fetch_cache_key(&jobs[i]),
-                                         jobs[i].bytes, jobs[i].host_buf);
+                                         jobs[i].bytes, jobs[i].host_buf,
+                                         jobs[i].payload_off);
             jobs[i].host_buf = NULL;
         }
     }
@@ -2751,7 +2922,7 @@ static int cuda_model_copy_to_device_streamed(
         free(capture);
         return 0;
     }
-    if (capture) cuda_host_cache_insert_owned(offset, bytes, capture);
+    if (capture) cuda_host_cache_insert_owned(offset, bytes, capture, 0);
     return 1;
 }
 
