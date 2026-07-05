@@ -35162,7 +35162,6 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
-    if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) return 0;
     return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
 }
 
@@ -38802,12 +38801,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (opt->mtp_path && opt->mtp_path[0]) {
-            fprintf(stderr, "ds4: --mtp is not supported for GLM 5.2 yet\n");
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
+        /* GLM MTP: the draft block lives in the main GGUF (blk.78 plus the
+         * nextn glue), so --mtp needs no separate file; binding happens as a
+         * view over weights.layer[DS4_N_LAYER-1] after weights_bind below.
+         * Experimental first implementation; strict mode is the oracle. */
         if (opt->first_token_test) {
             if (e->backend != DS4_BACKEND_CPU) {
                 fprintf(stderr, "ds4: GLM first-token test is CPU-only; pass --cpu\n");
@@ -38900,12 +38897,39 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
-        mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
-        e->mtp_ready = true;
-        fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
-                opt->mtp_path,
-                e->mtp_draft_tokens);
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+            /* Draft block is blk.(N_LAYER-1) of the main model; expose it
+             * through the mtp_weights view. e_proj/h_proj stay NULL (GLM
+             * fuses them as nextn_eh_proj); hc_head_* stay NULL (no mHC). */
+            const uint32_t mtp_il = DS4_N_LAYER - 1u;
+            const ds4_layer_weights *ml = &e->weights.layer[mtp_il];
+            if (!ml->nextn_eh_proj || !ml->nextn_enorm || !ml->nextn_hnorm ||
+                !ml->nextn_shared_head_norm) {
+                fprintf(stderr,
+                        "ds4: GLM MTP requested but blk.%u nextn tensors are missing\n",
+                        mtp_il);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            memset(&e->mtp_weights, 0, sizeof(e->mtp_weights));
+            e->mtp_weights.enorm = ml->nextn_enorm;
+            e->mtp_weights.hnorm = ml->nextn_hnorm;
+            e->mtp_weights.norm = ml->nextn_shared_head_norm;
+            e->mtp_weights.block = *ml;
+            e->mtp_ready = true;
+            fprintf(stderr,
+                    "ds4: GLM MTP draft bound from blk.%u (draft=%d)\n",
+                    mtp_il,
+                    e->mtp_draft_tokens);
+        } else {
+            model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+            mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
+            e->mtp_ready = true;
+            fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
+                    opt->mtp_path,
+                    e->mtp_draft_tokens);
+        }
     }
 
 #ifndef DS4_NO_GPU
