@@ -2685,7 +2685,18 @@ static int cuda_fetch_job_prepare_read(cuda_fetch_job *job) {
     job->read_done = 0;
     job->payload_off = 0;
 #if defined(__linux__) && defined(O_DIRECT)
-    if (job->fd == g_model_fd && g_model_direct_fd >= 0 &&
+    /* Buffered reads let the page cache hold part of the model, which wins
+     * when model size is within a small multiple of RAM (e.g. Flash 86GB on
+     * a 30GB box); O_DIRECT wins when the model dwarfs RAM (GLM 211GB) and
+     * cache churn is pure overhead. DS4_CUDA_FETCH_BUFFERED=1 forces the
+     * buffered path. */
+    static int force_buffered = -1;
+    if (force_buffered < 0) {
+        const char *fb = getenv("DS4_CUDA_FETCH_BUFFERED");
+        force_buffered = fb && fb[0] == '1';
+    }
+    if (!force_buffered &&
+        job->fd == g_model_fd && g_model_direct_fd >= 0 &&
         g_model_direct_align > 1 && g_model_file_size != 0) {
         const uint64_t a = g_model_direct_align;
         const uint64_t aligned_off = job->offset & ~(a - 1u);
