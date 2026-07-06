@@ -1,7 +1,7 @@
-# ds4 — GLM-5.2 (743B) on a single consumer GPU
+# NeutronStar — GLM-5.2 (743B) on a single consumer GPU
 
-This is a fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar). The
-`glm-local` branch you are reading adds a **CUDA port for GLM-5.2**, a stack of
+This is a fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar), collapsed
+further. The `glm-local` branch you are reading adds a **CUDA port for GLM-5.2**, a stack of
 SSD expert-streaming optimizations, and the **first MTP speculative-decoding
 implementation for GLM 5.2 on any backend**.
 
@@ -79,7 +79,7 @@ Plus `DS4_CUDA_ARENA_VRAM_RESERVE_GB` to keep VRAM headroom for batch kernels.
 ## Quick start
 
 ```sh
-git clone -b glm-local https://github.com/giannisanni/ds4
+git clone -b glm-local https://github.com/giannisanni/neutronstar
 cd ds4 && make cuda CUDA_ARCH=sm_89
 
 M=GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf
