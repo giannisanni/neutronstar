@@ -41062,36 +41062,67 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 
                 const uint32_t pos = (uint32_t)s->checkpoint.len;
                 uint32_t chunk = (uint32_t)(prompt->len - i);
-                if (chunk > s->glm_graph.indexed_prefill_cap) {
-                    chunk = s->glm_graph.indexed_prefill_cap;
+                /* Prefer the sequential token-major path for small streaming
+                 * resumes, mirroring the initial-prefill routing: the indexed
+                 * batch reads routed experts through whole-tensor model views
+                 * on CUDA, which spikes host memory far beyond a short
+                 * suffix's worth of work. */
+                const bool resume_token_major =
+                    glm_graph_use_streaming_token_prefill(&s->glm_graph, pos, chunk);
+                if (resume_token_major) {
+                    if (chunk > DS4_GLM_STREAM_PREFILL_TOKEN_MAJOR_MAX_TOKENS) {
+                        chunk = DS4_GLM_STREAM_PREFILL_TOKEN_MAJOR_MAX_TOKENS;
+                    }
+                } else {
+                    if (chunk > s->glm_graph.indexed_prefill_cap) {
+                        chunk = s->glm_graph.indexed_prefill_cap;
+                    }
+                    chunk = glm_graph_limit_indexed_prefill_chunk(pos, chunk);
+                    if (chunk == 0) chunk = 1;
                 }
-                chunk = glm_graph_limit_indexed_prefill_chunk(pos, chunk);
-                if (chunk == 0) chunk = 1;
                 float *chunk_logits =
                     (i + (int)chunk >= prompt->len) ? s->logits : NULL;
                 if (sync_trace) {
                     fprintf(stderr,
-                            "ds4: GLM sync branch=indexed_resume pos=%u chunk=%u logits=%d\n",
+                            "ds4: GLM sync branch=%s pos=%u chunk=%u logits=%d\n",
+                            resume_token_major ? "token_major_resume" : "indexed_resume",
                             pos,
                             chunk,
                             chunk_logits ? 1 : 0);
                 }
-                if (!glm_graph_forward_indexed_tokens(&s->glm_graph,
-                                                      &e->model,
-                                                      &e->weights,
-                                                      prompt->v + i,
-                                                      NULL,
-                                                      pos,
-                                                      chunk,
-                                                      NULL,
-                                                      chunk_logits,
-                                                      s->display_progress,
-                                                      s->display_progress_ud,
-                                                      (uint32_t)start,
-                                                      (uint32_t)(i - start),
-                                                      (uint32_t)suffix))
+                bool resume_chunk_ok;
+                if (resume_token_major) {
+                    resume_chunk_ok = glm_graph_prefill_token_major(&s->glm_graph,
+                                                                    &e->model,
+                                                                    &e->weights,
+                                                                    prompt->v + i,
+                                                                    pos,
+                                                                    chunk,
+                                                                    chunk_logits,
+                                                                    s->display_progress,
+                                                                    s->display_progress_ud,
+                                                                    (uint32_t)start,
+                                                                    (uint32_t)(i - start),
+                                                                    (uint32_t)suffix);
+                } else {
+                    resume_chunk_ok = glm_graph_forward_indexed_tokens(&s->glm_graph,
+                                                                       &e->model,
+                                                                       &e->weights,
+                                                                       prompt->v + i,
+                                                                       NULL,
+                                                                       pos,
+                                                                       chunk,
+                                                                       NULL,
+                                                                       chunk_logits,
+                                                                       s->display_progress,
+                                                                       s->display_progress_ud,
+                                                                       (uint32_t)start,
+                                                                       (uint32_t)(i - start),
+                                                                       (uint32_t)suffix);
+                }
+                if (!resume_chunk_ok)
                 {
-                    snprintf(err, errlen, "%s GLM indexed prefill failed while extending checkpoint",
+                    snprintf(err, errlen, "%s GLM prefill failed while extending checkpoint",
                              backend_name);
                     s->checkpoint_valid = false;
                     s->mtp_draft_valid = false;
