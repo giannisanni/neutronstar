@@ -93,7 +93,25 @@ Nobody had run interactive GLM sessions on CUDA streaming before, and it showed:
 - the uniform-Q2_K expert-cache gate would overrun IQ2_XXS-sized cache slabs
   with a mixed-quant model (now slab-budget checked),
 - session resume (chat turn 2+) routed into the batch prefill and OOM'd 30GB
-  hosts (now token-major for small suffixes).
+  hosts (now token-major for small suffixes),
+- the batch MoE expert-tile kernels loaded the IQ2 dequant LUTs into shared
+  memory only for models with n_embd <= 4096 (16 q8_K blocks) but consumed
+  them unconditionally: GLM's 7168 embd (28 blocks) dequantized gate/up
+  against uninitialized shared memory. Every multi-token batch produced
+  fluent garbage at full speed, and the MTP verify (n=2, same kernels)
+  returned corrupt logits. Upstream-affecting: any n_embd > 4096 model on
+  the CUDA batch path. Fixed by hoisting the LUT loads.
+
+### Long-prompt prefill: 0.30 -> 6.5 t/s (21x)
+With the LUT fix, GLM batch prefill works and is transformative: a 600-token
+prompt prefills at **6.5 t/s** vs 0.30 t/s token-major, because a chunk's
+tokens per layer collectively route to most of the 256 experts, so one
+full-layer sequential read serves the whole chunk (~350MB/token at chunk 256
+vs 5.4GB/token single). Prompts <= 64 tokens still run token-major by
+design. This is the same expert-overlap physics that makes speculative
+decoding unprofitable here, with the sign flipped: overlap is near-zero
+across 2 speculative tokens and near-total across a 600-token chunk. A full
+4k-context paste is ~10 minutes on a Gen4 x4 drive today.
 
 Plus `DS4_CUDA_ARENA_VRAM_RESERVE_GB` to keep VRAM headroom for batch kernels.
 
