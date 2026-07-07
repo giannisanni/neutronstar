@@ -19,10 +19,12 @@ just slowly.
 
 ## The model
 
-Grab the matching quant (custom merge, uniform-slab routed experts, MTP layer
+Grab the matching quant (antirez's official ds4 build, mirrored with full
+per-tensor recipe documentation; uniform-slab routed experts, MTP layer
 included in the main file):
 
 **[huggingface.co/giannisan/GLM-5.2-ds4-gguf](https://huggingface.co/giannisan/GLM-5.2-ds4-gguf)**
+(bit-identical to [antirez/GLM-5.2-GGUF](https://huggingface.co/antirez/GLM-5.2-GGUF))
 
 Recipe in that card. Short version: all routed experts uniform IQ2_XXS (the
 streaming cache uses fixed-size slabs and the dp4a kernels decode IQ2_XXS
