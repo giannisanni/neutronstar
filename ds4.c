@@ -29005,36 +29005,40 @@ static bool glm_graph_indexer_qat(void) {
     return false;
 }
 
+/* Runtime kill-switches for the batch-FFN sub-stages. The GLM CUDA batch
+ * prefill produces corrupt hidden state (fast garbage at 6 t/s) while the
+ * per-token FFN over the same batch attention is correct, so the bug lives
+ * in one of these stages; the envs let a single build bisect it. */
 static bool glm_graph_indexed_prefill_batch_ffn(void) {
-    return true;
+    return getenv("DS4_GLM_DISABLE_BATCH_FFN") == NULL;
 }
 
 static bool glm_graph_indexed_prefill_batch_ffn_norm(void) {
-    return true;
+    return getenv("DS4_GLM_DISABLE_BATCH_FFN_NORM") == NULL;
 }
 
 static bool glm_graph_indexed_prefill_batch_routed_moe(void) {
-    return true;
+    return getenv("DS4_GLM_DISABLE_BATCH_ROUTED_MOE") == NULL;
 }
 
 static bool glm_graph_indexed_prefill_batch_router_select(void) {
-    return true;
+    return getenv("DS4_GLM_DISABLE_BATCH_ROUTER_SELECT") == NULL;
 }
 
 static bool glm_graph_indexed_prefill_batch_residual(void) {
-    return true;
+    return getenv("DS4_GLM_DISABLE_BATCH_RESIDUAL") == NULL;
 }
 
 static bool glm_graph_indexed_prefill_batch_f32_rows(void) {
-    return true;
+    return getenv("DS4_GLM_DISABLE_BATCH_F32_ROWS") == NULL;
 }
 
 static bool glm_graph_indexed_prefill_batch_q8_rows(void) {
-    return true;
+    return getenv("DS4_GLM_DISABLE_BATCH_Q8_ROWS") == NULL;
 }
 
 static bool glm_graph_indexed_prefill_batch_shared_expert(void) {
-    return true;
+    return getenv("DS4_GLM_DISABLE_BATCH_SHARED_EXPERT") == NULL;
 }
 
 static bool glm_graph_matmul_q8_0_tensor(
