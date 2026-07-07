@@ -215,12 +215,19 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static cuda_stream_selected_cache g_stream_selected_cache;
-static cuda_stream_expert_cache g_stream_expert_cache;
+/* Expert caches are kept per (gate,down) byte-size class: mixed-quant models
+ * (e.g. the q2-q4-imatrix Flash GGUF) interleave layers whose routed experts
+ * have different byte sizes. A single cache keyed on the last-seen size gets
+ * released and reallocated on every layer-size transition, so it never
+ * accumulates hits (decode collapses to ~1 t/s with permanent cap-log spam).
+ * Keeping one small cache per size class removes the thrash. */
+#define DS4_CUDA_STREAM_EXPERT_CLASSES 4
+static cuda_stream_expert_cache g_stream_expert_caches[DS4_CUDA_STREAM_EXPERT_CLASSES];
 static uint32_t g_stream_expert_budget_override;
-static uint32_t g_stream_expert_runtime_cap;
-static uint32_t g_stream_expert_memory_cap_notice;
-static uint64_t g_stream_expert_runtime_gate_bytes;
-static uint64_t g_stream_expert_runtime_down_bytes;
+static uint32_t g_stream_expert_runtime_caps[DS4_CUDA_STREAM_EXPERT_CLASSES];
+static uint32_t g_stream_expert_memory_cap_notices[DS4_CUDA_STREAM_EXPERT_CLASSES];
+static uint64_t g_stream_expert_class_gate_bytes[DS4_CUDA_STREAM_EXPERT_CLASSES];
+static uint64_t g_stream_expert_class_down_bytes[DS4_CUDA_STREAM_EXPERT_CLASSES];
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
@@ -1511,27 +1518,52 @@ static void cuda_stream_selected_cache_release(void) {
     memset(&g_stream_selected_cache, 0, sizeof(g_stream_selected_cache));
 }
 
+static void cuda_stream_expert_cache_release_class(int class_idx) {
+    cuda_stream_expert_cache *cache = &g_stream_expert_caches[class_idx];
+    if (cache->gate_ptr) {
+        (void)cudaFree(cache->gate_ptr);
+    }
+    if (cache->up_ptr) {
+        (void)cudaFree(cache->up_ptr);
+    }
+    if (cache->down_ptr) {
+        (void)cudaFree(cache->down_ptr);
+    }
+    std::vector<cuda_stream_expert_cache_slot>().swap(cache->slots);
+    cache->valid = 0;
+    cache->capacity = 0;
+    cache->count = 0;
+    cache->tick = 0;
+    cache->gate_expert_bytes = 0;
+    cache->down_expert_bytes = 0;
+    cache->gate_ptr = NULL;
+    cache->up_ptr = NULL;
+    cache->down_ptr = NULL;
+    cache->gate_capacity = 0;
+    cache->up_capacity = 0;
+    cache->down_capacity = 0;
+}
+
 static void cuda_stream_expert_cache_release_all(void) {
-    if (g_stream_expert_cache.gate_ptr) {
-        (void)cudaFree(g_stream_expert_cache.gate_ptr);
+    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
+        cuda_stream_expert_cache_release_class(i);
+        g_stream_expert_class_gate_bytes[i] = 0;
+        g_stream_expert_class_down_bytes[i] = 0;
+        g_stream_expert_runtime_caps[i] = 0;
+        g_stream_expert_memory_cap_notices[i] = 0;
     }
-    if (g_stream_expert_cache.up_ptr) {
-        (void)cudaFree(g_stream_expert_cache.up_ptr);
-    }
-    if (g_stream_expert_cache.down_ptr) {
-        (void)cudaFree(g_stream_expert_cache.down_ptr);
-    }
-    g_stream_expert_cache.slots.clear();
-    memset(&g_stream_expert_cache, 0, sizeof(g_stream_expert_cache));
 }
 
 static void cuda_stream_expert_cache_invalidate(void) {
-    for (cuda_stream_expert_cache_slot &slot : g_stream_expert_cache.slots) {
-        slot.valid = 0;
+    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
+        cuda_stream_expert_cache *cache = &g_stream_expert_caches[i];
+        for (cuda_stream_expert_cache_slot &slot : cache->slots) {
+            slot.valid = 0;
+        }
+        cache->valid = 0;
+        cache->count = 0;
+        cache->tick = 0;
     }
-    g_stream_expert_cache.valid = 0;
-    g_stream_expert_cache.count = 0;
-    g_stream_expert_cache.tick = 0;
 }
 
 static uint32_t cuda_stream_expert_cache_requested_budget(void) {
@@ -1554,10 +1586,26 @@ static uint32_t cuda_stream_expert_cache_requested_budget(void) {
     return cap;
 }
 
+static uint32_t cuda_stream_expert_cache_configured_budget_class(int class_idx) {
+    uint32_t cap = cuda_stream_expert_cache_requested_budget();
+    if (g_stream_expert_runtime_caps[class_idx] != 0 &&
+        cap > g_stream_expert_runtime_caps[class_idx]) {
+        cap = g_stream_expert_runtime_caps[class_idx];
+    }
+    return cap;
+}
+
+/* Class-less view (reporting/shared queries): apply the most restrictive
+ * runtime cap across the active classes. */
 static uint32_t cuda_stream_expert_cache_configured_budget(void) {
     uint32_t cap = cuda_stream_expert_cache_requested_budget();
-    if (g_stream_expert_runtime_cap != 0 && cap > g_stream_expert_runtime_cap) {
-        cap = g_stream_expert_runtime_cap;
+    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
+        if ((g_stream_expert_class_gate_bytes[i] != 0 ||
+             g_stream_expert_class_down_bytes[i] != 0) &&
+            g_stream_expert_runtime_caps[i] != 0 &&
+            cap > g_stream_expert_runtime_caps[i]) {
+            cap = g_stream_expert_runtime_caps[i];
+        }
     }
     return cap;
 }
@@ -1591,6 +1639,7 @@ static uint64_t cuda_stream_expert_cache_reserve_bytes(void) {
 }
 
 static uint32_t cuda_stream_expert_cache_live_budget(
+        int class_idx,
         uint32_t requested,
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
@@ -1630,13 +1679,13 @@ static uint32_t cuda_stream_expert_cache_live_budget(
         reserve = total_bytes / 2ull;
     }
     if (free_bytes <= reserve) {
-        if (report && g_stream_expert_memory_cap_notice != requested) {
+        if (report && g_stream_expert_memory_cap_notices[class_idx] != requested) {
             cuda_model_load_progress_finish();
             fprintf(stderr,
                     "ds4: CUDA streaming expert cache disabled: available %.2f GiB <= reserve %.2f GiB\n",
                     (double)free_bytes / 1073741824.0,
                     (double)reserve / 1073741824.0);
-            g_stream_expert_memory_cap_notice = requested;
+            g_stream_expert_memory_cap_notices[class_idx] = requested;
         }
         return 0;
     }
@@ -1646,7 +1695,8 @@ static uint32_t cuda_stream_expert_cache_live_budget(
     if (max_slots64 > UINT32_MAX) max_slots64 = UINT32_MAX;
     uint32_t capped = requested;
     if ((uint64_t)capped > max_slots64) capped = (uint32_t)max_slots64;
-    if (report && capped != requested && g_stream_expert_memory_cap_notice != capped) {
+    if (report && capped != requested &&
+        g_stream_expert_memory_cap_notices[class_idx] != capped) {
         cuda_model_load_progress_finish();
         fprintf(stderr,
                 "ds4: CUDA streaming expert cache capped from %u to %u experts "
@@ -1656,7 +1706,7 @@ static uint32_t cuda_stream_expert_cache_live_budget(
                 (double)free_bytes / 1073741824.0,
                 (double)reserve / 1073741824.0,
                 (double)per_expert_bytes / 1048576.0);
-        g_stream_expert_memory_cap_notice = capped;
+        g_stream_expert_memory_cap_notices[class_idx] = capped;
     }
     return capped;
 }
@@ -1672,17 +1722,36 @@ static uint64_t cuda_stream_expert_cache_expert_bytes(
     return gate_expert_bytes * 2ull + down_expert_bytes;
 }
 
-static void cuda_stream_expert_cache_note_size(
+/* Return the size-class index for (gate,down), assigning a free slot on
+ * first sight. If distinct classes exceed DS4_CUDA_STREAM_EXPERT_CLASSES
+ * (never observed in official GGUFs), class 0 is recycled: that size falls
+ * back to the pre-patch behavior (cache rebuilt) without touching the
+ * others. */
+static int cuda_stream_expert_cache_class_index(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
-    if (g_stream_expert_runtime_gate_bytes == gate_expert_bytes &&
-        g_stream_expert_runtime_down_bytes == down_expert_bytes) {
-        return;
+    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
+        if (g_stream_expert_class_gate_bytes[i] == gate_expert_bytes &&
+            g_stream_expert_class_down_bytes[i] == down_expert_bytes) {
+            return i;
+        }
     }
-    g_stream_expert_runtime_gate_bytes = gate_expert_bytes;
-    g_stream_expert_runtime_down_bytes = down_expert_bytes;
-    g_stream_expert_runtime_cap = 0;
-    g_stream_expert_memory_cap_notice = 0;
+    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
+        if (g_stream_expert_class_gate_bytes[i] == 0 &&
+            g_stream_expert_class_down_bytes[i] == 0) {
+            g_stream_expert_class_gate_bytes[i] = gate_expert_bytes;
+            g_stream_expert_class_down_bytes[i] = down_expert_bytes;
+            g_stream_expert_runtime_caps[i] = 0;
+            g_stream_expert_memory_cap_notices[i] = 0;
+            return i;
+        }
+    }
+    cuda_stream_expert_cache_release_class(0);
+    g_stream_expert_class_gate_bytes[0] = gate_expert_bytes;
+    g_stream_expert_class_down_bytes[0] = down_expert_bytes;
+    g_stream_expert_runtime_caps[0] = 0;
+    g_stream_expert_memory_cap_notices[0] = 0;
+    return 0;
 }
 
 static uint32_t cuda_stream_expert_cache_shrunken_cap(uint32_t cap) {
@@ -1692,15 +1761,16 @@ static uint32_t cuda_stream_expert_cache_shrunken_cap(uint32_t cap) {
 }
 
 static void cuda_stream_expert_cache_note_oom_cap(
+        int class_idx,
         uint32_t failed_cap,
         uint32_t new_cap,
         uint64_t expert_bytes,
         const char *errstr) {
-    if (g_stream_expert_runtime_cap != 0 &&
-        g_stream_expert_runtime_cap <= new_cap) {
+    if (g_stream_expert_runtime_caps[class_idx] != 0 &&
+        g_stream_expert_runtime_caps[class_idx] <= new_cap) {
         return;
     }
-    g_stream_expert_runtime_cap = new_cap;
+    g_stream_expert_runtime_caps[class_idx] = new_cap;
     const uint32_t released =
         failed_cap > new_cap ? failed_cap - new_cap : 0;
     cuda_model_load_progress_finish();
@@ -1908,47 +1978,52 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
         cuda_stream_expert_cache_expert_bytes(gate_expert_bytes,
                                               down_expert_bytes);
     if (expert_bytes == 0) return NULL;
-    cuda_stream_expert_cache_note_size(gate_expert_bytes, down_expert_bytes);
+    const int class_idx =
+        cuda_stream_expert_cache_class_index(gate_expert_bytes,
+                                             down_expert_bytes);
+    cuda_stream_expert_cache *cache = &g_stream_expert_caches[class_idx];
 
-    const uint32_t requested_cap = cuda_stream_expert_cache_configured_budget();
+    const uint32_t requested_cap =
+        cuda_stream_expert_cache_configured_budget_class(class_idx);
     if (requested_cap == 0) return NULL;
     if (target_cap == 0 || target_cap > requested_cap) target_cap = requested_cap;
     if (target_cap == 0) return NULL;
     const int same_dims =
-        g_stream_expert_cache.valid &&
-        g_stream_expert_cache.gate_expert_bytes == gate_expert_bytes &&
-        g_stream_expert_cache.down_expert_bytes == down_expert_bytes;
-    if (!same_dims && g_stream_expert_cache.valid) {
-        cuda_stream_expert_cache_release_all();
+        cache->valid &&
+        cache->gate_expert_bytes == gate_expert_bytes &&
+        cache->down_expert_bytes == down_expert_bytes;
+    if (!same_dims && cache->valid) {
+        cuda_stream_expert_cache_release_class(class_idx);
     }
     if (same_dims &&
-        g_stream_expert_cache.capacity != 0 &&
-        g_stream_expert_cache.capacity >= target_cap &&
-        g_stream_expert_cache.slots.size() == g_stream_expert_cache.capacity) {
-        return &g_stream_expert_cache;
+        cache->capacity != 0 &&
+        cache->capacity >= target_cap &&
+        cache->slots.size() == cache->capacity) {
+        return cache;
     }
 
     uint64_t reclaim_bytes = 0;
     if (same_dims &&
-        g_stream_expert_cache.capacity != 0 &&
-        (uint64_t)g_stream_expert_cache.capacity <= UINT64_MAX / expert_bytes) {
-        reclaim_bytes = (uint64_t)g_stream_expert_cache.capacity * expert_bytes;
+        cache->capacity != 0 &&
+        (uint64_t)cache->capacity <= UINT64_MAX / expert_bytes) {
+        reclaim_bytes = (uint64_t)cache->capacity * expert_bytes;
     }
     uint32_t cap =
-        cuda_stream_expert_cache_live_budget(target_cap,
+        cuda_stream_expert_cache_live_budget(class_idx,
+                                             target_cap,
                                              gate_expert_bytes,
                                              down_expert_bytes,
                                              reclaim_bytes,
                                              reclaim_bytes == 0);
     if (cap == 0) return NULL;
     if (same_dims &&
-        g_stream_expert_cache.capacity != 0 &&
-        g_stream_expert_cache.capacity >= cap &&
-        g_stream_expert_cache.slots.size() == g_stream_expert_cache.capacity) {
-        return &g_stream_expert_cache;
+        cache->capacity != 0 &&
+        cache->capacity >= cap &&
+        cache->slots.size() == cache->capacity) {
+        return cache;
     }
 
-    cuda_stream_expert_cache_release_all();
+    cuda_stream_expert_cache_release_class(class_idx);
     while (cap != 0) {
         if ((uint64_t)cap > UINT64_MAX / gate_expert_bytes ||
             (uint64_t)cap > UINT64_MAX / down_expert_bytes) {
@@ -1969,13 +2044,15 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
                                                 &alloc_error)) {
             const uint32_t new_cap =
                 cuda_stream_expert_cache_shrunken_cap(cap);
-            cuda_stream_expert_cache_note_oom_cap(cap,
+            cuda_stream_expert_cache_note_oom_cap(class_idx,
+                                                  cap,
                                                   new_cap,
                                                   expert_bytes,
                                                   alloc_error);
             cap = new_cap;
             if (cap != 0) {
-                cap = cuda_stream_expert_cache_live_budget(cap,
+                cap = cuda_stream_expert_cache_live_budget(class_idx,
+                                                           cap,
                                                            gate_expert_bytes,
                                                            down_expert_bytes,
                                                            0,
@@ -1985,32 +2062,32 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
         }
 
         try {
-            g_stream_expert_cache.slots.resize(cap);
+            cache->slots.resize(cap);
         } catch (...) {
             fprintf(stderr, "ds4: CUDA streaming expert cache metadata allocation failed\n");
             (void)cudaFree(gate_ptr);
             (void)cudaFree(up_ptr);
             (void)cudaFree(down_ptr);
-            cuda_stream_expert_cache_release_all();
+            cuda_stream_expert_cache_release_class(class_idx);
             return NULL;
         }
 
-        g_stream_expert_cache.valid = 1;
-        g_stream_expert_cache.capacity = cap;
-        g_stream_expert_cache.count = 0;
-        g_stream_expert_cache.tick = 0;
-        g_stream_expert_cache.gate_expert_bytes = gate_expert_bytes;
-        g_stream_expert_cache.down_expert_bytes = down_expert_bytes;
-        g_stream_expert_cache.gate_ptr = gate_ptr;
-        g_stream_expert_cache.up_ptr = up_ptr;
-        g_stream_expert_cache.down_ptr = down_ptr;
-        g_stream_expert_cache.gate_capacity =
+        cache->valid = 1;
+        cache->capacity = cap;
+        cache->count = 0;
+        cache->tick = 0;
+        cache->gate_expert_bytes = gate_expert_bytes;
+        cache->down_expert_bytes = down_expert_bytes;
+        cache->gate_ptr = gate_ptr;
+        cache->up_ptr = up_ptr;
+        cache->down_ptr = down_ptr;
+        cache->gate_capacity =
             (uint64_t)cap * gate_expert_bytes;
-        g_stream_expert_cache.up_capacity =
+        cache->up_capacity =
             (uint64_t)cap * gate_expert_bytes;
-        g_stream_expert_cache.down_capacity =
+        cache->down_capacity =
             (uint64_t)cap * down_expert_bytes;
-        return &g_stream_expert_cache;
+        return cache;
     }
     return NULL;
 }
@@ -3681,10 +3758,10 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
-    g_stream_expert_runtime_cap = 0;
-    g_stream_expert_runtime_gate_bytes = 0;
-    g_stream_expert_runtime_down_bytes = 0;
-    g_stream_expert_memory_cap_notice = 0;
+    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
+        g_stream_expert_runtime_caps[i] = 0;
+        g_stream_expert_memory_cap_notices[i] = 0;
+    }
     if (!g_ssd_streaming_mode) {
         cuda_stream_selected_cache_release();
         cuda_stream_expert_cache_release_all();
@@ -3697,11 +3774,8 @@ extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     g_stream_expert_budget_override = experts;
-    g_stream_expert_runtime_cap = 0;
-    g_stream_expert_runtime_gate_bytes = 0;
-    g_stream_expert_runtime_down_bytes = 0;
-    g_stream_expert_memory_cap_notice = 0;
     cuda_stream_selected_cache_invalidate();
+    /* release_all also clears the classes, runtime caps, and notices. */
     cuda_stream_expert_cache_release_all();
 }
 
@@ -3719,7 +3793,11 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    return g_stream_expert_cache.count;
+    uint32_t count = 0;
+    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
+        count += g_stream_expert_caches[i].count;
+    }
+    return count;
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
@@ -3737,8 +3815,10 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
                                               down_expert_bytes) == 0) {
         return 0;
     }
-    cuda_stream_expert_cache_note_size(gate_expert_bytes, down_expert_bytes);
-    return cuda_stream_expert_cache_configured_budget();
+    const int class_idx =
+        cuda_stream_expert_cache_class_index(gate_expert_bytes,
+                                             down_expert_bytes);
+    return cuda_stream_expert_cache_configured_budget_class(class_idx);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
@@ -3801,6 +3881,29 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
     return 1;
 }
 
+/* Allocate (grow-only) the staging buffers for the selected experts. */
+static int cuda_stream_selected_cache_ensure_slots(
+        uint64_t compact_gate_bytes,
+        uint64_t compact_down_bytes,
+        uint32_t slot_count) {
+    return cuda_stream_selected_ensure_bytes(&g_stream_selected_cache.gate_ptr,
+                                             &g_stream_selected_cache.gate_capacity,
+                                             compact_gate_bytes,
+                                             "selected gate experts") &&
+           cuda_stream_selected_ensure_bytes(&g_stream_selected_cache.up_ptr,
+                                             &g_stream_selected_cache.up_capacity,
+                                             compact_gate_bytes,
+                                             "selected up experts") &&
+           cuda_stream_selected_ensure_bytes(&g_stream_selected_cache.down_ptr,
+                                             &g_stream_selected_cache.down_capacity,
+                                             compact_down_bytes,
+                                             "selected down experts") &&
+           cuda_stream_selected_ensure_i32(&g_stream_selected_cache.slot_selected_ptr,
+                                           &g_stream_selected_cache.slot_selected_capacity,
+                                           slot_count,
+                                           "selected expert slots");
+}
+
 static int cuda_stream_selected_cache_begin_compact_load(
         const void    *model_map,
         uint64_t       model_size,
@@ -3816,7 +3919,8 @@ static int cuda_stream_selected_cache_begin_compact_load(
         uint64_t       gate_expert_bytes,
         uint64_t       down_expert_bytes,
         int            strict_failure,
-        int            allow_global_cache) {
+        int            allow_global_cache,
+        int            allow_cache_evict) {
     cuda_stream_selected_cache_invalidate();
     cuda_model_load_progress_finish();
 
@@ -3848,35 +3952,36 @@ static int cuda_stream_selected_cache_begin_compact_load(
         return 0;
     }
 
-    if (!allow_global_cache) {
+    /*
+     * Prefill batch loads (allow_global_cache=0) used to ALWAYS release the
+     * whole resident expert cache before allocating the staging buffers:
+     * long prompts need the VRAM, but for short (chat) prompts the
+     * unconditional release throws away GiBs of warm cache on EVERY request
+     * and forces a full decode re-warm. Strategy: try the allocation first;
+     * only if VRAM is really short, sacrifice the cache and retry once.
+     */
+    int selected_ok =
+        cuda_stream_selected_cache_ensure_slots(compact_gate_bytes,
+                                                compact_down_bytes,
+                                                slot_count);
+    if (!selected_ok) {
+        /* VRAM davvero corta (prompt molto lunghi): sacrifica la cache
+         * esperti e riprova una volta. */
         cuda_stream_expert_cache_release_all();
+        selected_ok =
+            cuda_stream_selected_cache_ensure_slots(compact_gate_bytes,
+                                                    compact_down_bytes,
+                                                    slot_count);
     }
-
-    if (!cuda_stream_selected_ensure_bytes(&g_stream_selected_cache.gate_ptr,
-                                           &g_stream_selected_cache.gate_capacity,
-                                           compact_gate_bytes,
-                                           "selected gate experts") ||
-        !cuda_stream_selected_ensure_bytes(&g_stream_selected_cache.up_ptr,
-                                           &g_stream_selected_cache.up_capacity,
-                                           compact_gate_bytes,
-                                           "selected up experts") ||
-        !cuda_stream_selected_ensure_bytes(&g_stream_selected_cache.down_ptr,
-                                           &g_stream_selected_cache.down_capacity,
-                                           compact_down_bytes,
-                                           "selected down experts") ||
-        !cuda_stream_selected_ensure_i32(&g_stream_selected_cache.slot_selected_ptr,
-                                         &g_stream_selected_cache.slot_selected_capacity,
-                                         slot_count,
-                                         "selected expert slots")) {
+    if (!selected_ok) {
         return strict_failure ? 0 : 1;
     }
 
-    if (allow_global_cache) {
-        cuda_stream_expert_cache_note_size(gate_expert_bytes,
-                                           down_expert_bytes);
-    }
-    const uint32_t configured_cache_budget =
-        cuda_stream_expert_cache_configured_budget();
+    const uint32_t configured_cache_budget = allow_global_cache ?
+        cuda_stream_expert_cache_configured_budget_class(
+            cuda_stream_expert_cache_class_index(gate_expert_bytes,
+                                                 down_expert_bytes)) :
+        0;
     const int use_global_cache =
         allow_global_cache &&
         configured_cache_budget != 0;
@@ -3962,29 +4067,38 @@ static int cuda_stream_selected_cache_begin_compact_load(
                 backfill_count++;
             } else {
                 cache_misses++;
-                const uint32_t load_slot =
-                    cuda_stream_expert_cache_lru_slot(expert_cache);
-                const int append = !expert_cache->slots[load_slot].valid;
-                if (cuda_stream_expert_cache_load_slot(expert_cache,
-                                                       model_map,
-                                                       model_size,
-                                                       load_slot,
-                                                       layer,
-                                                       n_total_expert,
-                                                       (uint32_t)expert,
-                                                       gate_offset,
-                                                       up_offset,
-                                                       down_offset,
-                                                       gate_expert_bytes,
-                                                       down_expert_bytes)) {
-                    if (append && expert_cache->count < expert_cache->capacity) {
-                        expert_cache->count++;
+                /*
+                 * Prefill batch loads (allow_cache_evict=0) may append while
+                 * free capacity remains but must NOT evict valid slots: a
+                 * long prompt would cycle the whole LRU cache and destroy
+                 * the decode's warm working set.
+                 */
+                if (allow_cache_evict ||
+                    expert_cache->count < expert_cache->capacity) {
+                    const uint32_t load_slot =
+                        cuda_stream_expert_cache_lru_slot(expert_cache);
+                    const int append = !expert_cache->slots[load_slot].valid;
+                    if (cuda_stream_expert_cache_load_slot(expert_cache,
+                                                           model_map,
+                                                           model_size,
+                                                           load_slot,
+                                                           layer,
+                                                           n_total_expert,
+                                                           (uint32_t)expert,
+                                                           gate_offset,
+                                                           up_offset,
+                                                           down_offset,
+                                                           gate_expert_bytes,
+                                                           down_expert_bytes)) {
+                        if (append && expert_cache->count < expert_cache->capacity) {
+                            expert_cache->count++;
+                        }
+                        cache_slot = (int)load_slot;
+                    } else {
+                        cuda_stream_expert_cache_invalidate();
+                        expert_cache_disabled = 1;
+                        cache_slot = -1;
                     }
-                    cache_slot = (int)load_slot;
-                } else {
-                    cuda_stream_expert_cache_invalidate();
-                    expert_cache_disabled = 1;
-                    cache_slot = -1;
                 }
             }
 
@@ -4300,6 +4414,7 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
             gate_expert_bytes,
             down_expert_bytes,
             0,
+            1,
             1);
 }
 
@@ -4369,6 +4484,13 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             down_offset,
             gate_expert_bytes,
             down_expert_bytes,
+            1,
+            /*
+             * The prefill batch also reads the global expert cache: hits
+             * become device-to-device copies instead of host->device uploads
+             * (short prompts drop from tens of seconds to a few). No evict
+             * though: see allow_cache_evict in the loop.
+             */
             1,
             0);
 }
