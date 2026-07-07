@@ -67,13 +67,21 @@ GLM-5.2 ships a draft head (blk.78) that no backend had wired up. This branch:
 
   Status (measured, 30GB host): the loop runs correctly end to end
   (`batches=16 accepted=3 tokens=20`, byte-identical output) but is a net
-  slowdown: per-token verify loads cost ~2 evals per 2-token batch, and
-  2/(1+p) evals/token cannot beat plain decode for any acceptance p. The
-  profitable version needs union expert loads across the verify rows (load
-  each selected expert once, run both rows against it). Also open: d2
-  acceptance measures 19% through the indexed-attention verify vs 61% in
-  probe mode against full-attention decode; near-tie argmax flips between
-  the two attention paths are the suspect.
+  slowdown, and the reason is structural, not an implementation gap.
+  Verify evals cost the same as decode evals (3.2 vs 3.1 s), because ~70%
+  of an eval is fetching that token's own expert set off disk, and two
+  rows' expert selections barely overlap (~10-20%). Speculative decoding
+  wins by sharing weight reads across batch rows; a disk-streaming MoE has
+  almost nothing to share, so every speculated token drags its own ~5GB
+  through the drive. Even with union expert loads across the verify rows,
+  a 2-token batch costs ~1.85 evals and yields 1+p tokens: at the
+  probe-measured d2 rate (p=0.61) that is 1.15 evals/token, still worse
+  than plain decode. MTP accept pays off in resident-weight regimes (like
+  ds4 Flash), not in expert-streaming ones; revisit only once disk stops
+  dominating. Also open: d2 acceptance measures 19% through the
+  indexed-attention verify vs 61% in probe mode against full-attention
+  decode; near-tie argmax flips between the two attention paths are the
+  suspect.
 
 ### Latent CUDA-streaming bugs fixed along the way
 Nobody had run interactive GLM sessions on CUDA streaming before, and it showed:
