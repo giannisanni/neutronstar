@@ -100,7 +100,8 @@ Nobody had run interactive GLM sessions on CUDA streaming before, and it showed:
   against uninitialized shared memory. Every multi-token batch produced
   fluent garbage at full speed, and the MTP verify (n=2, same kernels)
   returned corrupt logits. Upstream-affecting: any n_embd > 4096 model on
-  the CUDA batch path. Fixed by hoisting the LUT loads.
+  the CUDA batch path. Fixed by hoisting the LUT loads; submitted upstream
+  as antirez/ds4#513.
 
 ### Long-prompt prefill: 0.30 -> 6.5 t/s (21x)
 With the LUT fix, GLM batch prefill works and is transformative: a 600-token
