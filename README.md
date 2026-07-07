@@ -10,8 +10,10 @@ running it. Reference machine: RTX 4060 Ti 16GB, 30GB DDR5, Ryzen 9900X, one
 Gen4 NVMe. The model file is 196.6 GiB; routed experts are read from disk on
 every token while ~20 GiB of attention/shared weights stay resident.
 
-Current state on that machine: **~0.40 tokens/s generation, ~0.35 prefill**.
-The campaign arc was 0.05 → 0.40 t/s on identical hardware, all software.
+Current state on that machine: **~0.40 tokens/s generation, ~6.5 t/s
+long-prompt prefill** (batch path, prompts over 64 tokens; short prompts run
+token-major at generation speed). The campaign arc was 0.05 → 0.40 t/s
+generation and 0.30 → 6.5 t/s prefill on identical hardware, all software.
 HuggingFace tells you a 4060 Ti cannot run this model. HuggingFace is wrong,
 just slowly.
 
