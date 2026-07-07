@@ -1,0 +1,21 @@
+#!/bin/bash
+# GLM-5.2 chat wrapper.
+#   glm-chat                 clean Ollama-style chat (default)
+#   GLM_VERBOSE=1 glm-chat   adds per-token timing lines
+#   GLM_DEBUG=1 glm-chat     raw engine telemetry (old firehose)
+#   GLM_CACHE=7 glm-chat     bigger host expert cache: faster, less OOM headroom (default 5)
+cd ~/ds4-glm
+M=~/ds4-model/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf
+[ -n "$GLM_VERBOSE" ] && export DS4_TOKEN_TIMING=1
+CACHE="${GLM_CACHE:-5}"
+run() {
+  DS4_MTP_STREAMING_UNSAFE=1 DS4_GLM_CUDA_UNSAFE=1 \
+  DS4_CUDA_HOST_EXPERT_CACHE_GB=$CACHE DS4_CUDA_PARALLEL_FETCH_THREADS=16 \
+  ./ds4 -m "$M" --cuda --ssd-streaming --ssd-streaming-cache-experts 64 \
+    --ctx 4096 --tokens 400 --nothink "$@"
+}
+if [ -n "$GLM_DEBUG" ]; then
+  run "$@"
+else
+  run "$@" 2> >(grep --line-buffered -vE "host expert cache:|loading model tensors|arena using pinned|oom_score_adj|slab size class|WARNING: SSD|initial cuda model map|startup model preparation|graph diagnostics|memory: KV|memory detail|compact DSA|indexed prefill chunk|expert cache capped|expert cache enabled|fetch io_uring|CUDA backend initialized|mixed-precision model|preparing model tensor mappings" >&2)
+fi

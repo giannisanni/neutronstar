@@ -1,0 +1,9 @@
+#!/bin/bash
+# Pause/resume the media stack to free RAM for big LLM sessions.
+# Usage: llm-mode on | off
+STACK="prowlarr mediafusion-browserless mediafusion-api mediafusion-scheduler mediafusion-redis mediafusion-postgres aiostreams stremio-tunnel"
+case "$1" in
+  on)  docker stop $STACK >/dev/null 2>&1; echo "media stack paused, $(free -m | awk "/^Mem:/{print \$7}")MB available";;
+  off) docker start $STACK >/dev/null 2>&1; echo "media stack resumed";;
+  *)   echo "usage: llm-mode on|off"; exit 1;;
+esac
