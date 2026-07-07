@@ -57,10 +57,23 @@ GLM-5.2 ships a draft head (blk.78) that no backend had wired up. This branch:
   temp 0,
 - chains it recursively: d2 hits 61% conditional; depth 2 is the useful maximum
   (`DS4_GLM_MTP_DEPTH`),
-- includes an experimental accept loop (`DS4_GLM_MTP_ACCEPT=1`) with batch
-  verification. On a 30GB host it is memory-gated (the batch path reads whole
-  expert tensors through model views); it pays off once per-expert batch loads
-  land or on bigger-RAM machines. Probe mode (`DS4_MTP_PROBE=1`) works everywhere.
+- includes an accept loop (`DS4_GLM_MTP_ACCEPT=1`) with 2-token batch
+  verification. The batch MoE kernels address whole expert tensors through
+  model views, which under streaming OOM'd 30GB hosts;
+  `DS4_GLM_INDEXED_PER_EXPERT_FFN=1` reroutes small indexed batches through
+  the decode expert cache (only the selected experts load, per token), which
+  makes the accept loop run within a decode-sized memory budget. Probe mode
+  (`DS4_MTP_PROBE=1`) works everywhere.
+
+  Status (measured, 30GB host): the loop runs correctly end to end
+  (`batches=16 accepted=3 tokens=20`, byte-identical output) but is a net
+  slowdown: per-token verify loads cost ~2 evals per 2-token batch, and
+  2/(1+p) evals/token cannot beat plain decode for any acceptance p. The
+  profitable version needs union expert loads across the verify rows (load
+  each selected expert once, run both rows against it). Also open: d2
+  acceptance measures 19% through the indexed-attention verify vs 61% in
+  probe mode against full-attention decode; near-tie argmax flips between
+  the two attention paths are the suspect.
 
 ### Latent CUDA-streaming bugs fixed along the way
 Nobody had run interactive GLM sessions on CUDA streaming before, and it showed:
@@ -107,7 +120,8 @@ of headroom (7 GiB cache is the knife-edge, 5 is comfortable).
 | `DS4_CUDA_FETCH_BUFFERED` | 0 | page-cache reads (models ≲ RAM × small multiple) |
 | `DS4_GLM_EXPERT_PREFETCH` | 0 | cross-layer router-lookahead prefetch |
 | `DS4_GLM_MTP_DEPTH` | 4 | draft chain depth (2 is the useful max) |
-| `DS4_GLM_MTP_ACCEPT` | 0 | experimental speculative accept loop |
+| `DS4_GLM_MTP_ACCEPT` | 0 | experimental speculative accept loop (needs `--mtp` + `--temp 0`) |
+| `DS4_GLM_INDEXED_PER_EXPERT_FFN` | 0 | small indexed batches load selected experts per token instead of whole tensors |
 | `DS4_MTP_PROBE` | 0 | draft hit-rate telemetry |
 | `DS4_CUDA_ARENA_VRAM_RESERVE_GB` | 0 | VRAM headroom the weight arena must not eat |
 | `DS4_GLM_SYNC_TRACE` | 0 | session prefill branch tracing |

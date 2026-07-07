@@ -27007,6 +27007,22 @@ static bool glm_graph_stream_map_decode_layer(
     return metal_graph_stream_map_layer(model, weights, il);
 }
 
+/* Per-expert batch FFN (DS4_GLM_INDEXED_PER_EXPERT_FFN=1): route small
+ * indexed batches through the decode expert machinery instead of the batch
+ * MoE kernels. The batch kernels address whole expert tensors via model->map,
+ * which under SSD streaming demand-faults ~2.4GB/layer of routed experts and
+ * OOMs a 30GB box; the decode path loads only the selected experts per token
+ * through the expert cache. Layer maps go decode-style (static set only) and
+ * the FFN takes the per-token fallback for layers whose experts stream.
+ * Costs per-token router flushes, so wrong for big prefill chunks; right for
+ * the 2-token MTP verify batch. */
+static bool glm_graph_indexed_per_expert_ffn_enabled(
+        const ds4_glm_gpu_graph *g) {
+    return g &&
+           g->ssd_streaming &&
+           getenv("DS4_GLM_INDEXED_PER_EXPERT_FFN") != NULL;
+}
+
 static bool glm_graph_stream_map_prefill_layer(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -27032,15 +27048,26 @@ static bool glm_graph_stream_map_prefill_layer(
                                                        &weights->layer[il],
                                                        il,
                                                        n_tokens);
+    /* addr_supported only covers Q2_K/Q4_K expert layouts; per-expert FFN
+     * mode extends decode-style maps to any layer decode itself can stream
+     * (IQ2_XXS selected-expert views included). */
+    const bool per_expert_map =
+        !addr_supported &&
+        glm_graph_indexed_per_expert_ffn_enabled(g) &&
+        weights && il < DS4_N_LAYER &&
+        glm_stream_decode_experts_are_streamed(weights,
+                                               &weights->layer[il],
+                                               il);
     const char *trace = getenv("DS4_METAL_STREAMING_MAP_TRACE");
     if (trace && trace[0] && strcmp(trace, "0") != 0) {
         fprintf(stderr,
                 "ds4: GLM SSD prefill map layer=%u tokens=%u mode=%s\n",
                 il,
                 n_tokens,
-                addr_supported ? "decode-expert-cache" : "full-layer");
+                addr_supported ? "decode-expert-cache" :
+                per_expert_map ? "decode-per-expert" : "full-layer");
     }
-    if (addr_supported) {
+    if (addr_supported || per_expert_map) {
         return metal_graph_stream_map_layer_decode(model, weights, il);
     }
     return metal_graph_stream_map_layer(model, weights, il);
@@ -31657,7 +31684,14 @@ static bool glm_graph_forward_indexed_tokens(
                                       (uint64_t)n_tokens * DS4_N_EMBD,
                                       il,
                                       pos0);
-        if (ok && use_batch_ffn) {
+        /* Per-expert FFN: this layer's experts stream through the decode
+         * expert cache, so the whole-tensor batch MoE kernels must not run;
+         * the per-token fallback below loads only selected experts. */
+        const bool per_expert_ffn =
+            il >= DS4_N_LEADING_DENSE &&
+            glm_graph_indexed_per_expert_ffn_enabled(g) &&
+            glm_stream_decode_experts_are_streamed(weights, l, il);
+        if (ok && use_batch_ffn && !per_expert_ffn) {
             ok = glm_graph_encode_ffn_batch(g,
                                             model,
                                             l,
@@ -31688,6 +31722,7 @@ static bool glm_graph_forward_indexed_tokens(
             if (ok &&
                 use_batch_ffn_norm &&
                 il >= DS4_N_LEADING_DENSE &&
+                !per_expert_ffn &&
                 glm_graph_indexed_prefill_batch_routed_moe()) {
                 ok = glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
                         g,
