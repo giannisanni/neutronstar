@@ -4954,7 +4954,7 @@ static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m,
         l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
     } else {
         l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
-        l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+        l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b", il);
         l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
         l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
         l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
@@ -4988,7 +4988,7 @@ static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m,
  *     blk.N.ffn_gate.weight / ffn_up.weight / ffn_down.weight   [13312]
  *   MoE layers:
  *     blk.N.ffn_gate_inp.weight            router [4096 -> 192]
- *     blk.N.exp_probs_b.bias               expert bias [192]
+ *     blk.N.exp_probs_b                    expert bias [192] (no suffix)
  *     blk.N.ffn_{gate,up,down}_exps.weight [192 experts, ff 1536]
  *     blk.N.ffn_{gate,up,down}_shexp.weight  shared expert
  *   MTP layer (blk.80): the regular names above plus
@@ -5010,7 +5010,7 @@ static void weights_bind_hy_v3_layer(ds4_layer_weights *l, const ds4_model *m, u
         l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
     } else {
         l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
-        l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+        l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b", il);
         l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
         l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
         l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
