@@ -61,7 +61,8 @@ mark "PHASE 5: quantize to ds4 recipe (uniform IQ2_XXS experts, Q8_0 rest)"
 # NOTE: --tensor-type is unanchored regex_search; keep patterns anchored.
 # NOTE: NO pipes on this command (head/grep SIGPIPE killed earlier runs).
 ./build/bin/llama-quantize --allow-requantize --imatrix "$VOL/Hy3.imatrix.gguf" \
-  --tensor-type 'ffn_(gate|up|down)_exps\.weight=iq2_xxs' \
+  --tensor-type 'blk\.([0-9]|[1-7][0-9])\.ffn_(gate|up|down)_exps\.weight=iq2_xxs' \
+  --tensor-type 'blk\.80\.ffn_(gate|up|down)_exps\.weight=q2_k' \
   --tensor-type 'attn_(q|k|v|output)\.weight=q8_0' \
   --tensor-type 'ffn_(gate|up|down)_shexp\.weight=q8_0' \
   --tensor-type 'blk\.0\.ffn_(gate|up|down)\.weight=q8_0' \
