@@ -37,6 +37,7 @@ runpodctl create pod \
   --env "HF_TOKEN=$HF_TOKEN" \
   --env "RUNPOD_API_KEY=$KEY" \
   --env "JOB_URL=$RAW_URL" \
+  --env "CARD_B64=$(base64 < "$HERE/hf-model-card.md" | tr -d '\n')" \
   --args 'bash -c "curl -sL $JOB_URL -o /job.sh && bash /job.sh"'
 
 cat <<EOF

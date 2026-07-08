@@ -92,6 +92,8 @@ print("HEADER_OK")
 PY
 
 mark "PHASE 7: upload to HF"
+[ -n "${CARD_B64:-}" ] && echo "$CARD_B64" | base64 -d > /tmp/README.md && \
+  hf upload giannisan/Hy3-ds4-gguf /tmp/README.md README.md >>"$LOG" 2>&1
 hf upload giannisan/Hy3-ds4-gguf "$VOL/Hy3-ds4-IQ2XXS-AttnQ8.gguf" \
   Hy3-ds4-IQ2XXS-AttnQ8.gguf >>"$LOG" 2>&1 || die "hf upload"
 hf upload giannisan/Hy3-ds4-gguf "$VOL/job.log" build-log.txt >>"$LOG" 2>&1
