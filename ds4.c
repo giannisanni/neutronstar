@@ -4852,21 +4852,24 @@ static void config_validate_hy_v3_model(const ds4_model *m) {
     g_ds4_shape = DS4_SHAPE_HY3;
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
 
-    const uint32_t n_layer = required_u32(m, "hy_v3.block_count");
-    const uint64_t n_ctx = required_u64_compat(m, "hy_v3.context_length");
-    const uint32_t n_embd = required_u32(m, "hy_v3.embedding_length");
-    const uint32_t n_vocab = required_u32(m, "hy_v3.vocab_size");
-    const uint32_t n_ff_dense = required_u32(m, "hy_v3.feed_forward_length");
-    const uint32_t n_head = required_u32(m, "hy_v3.attention.head_count");
-    const uint32_t n_head_kv = required_u32(m, "hy_v3.attention.head_count_kv");
-    const uint32_t n_head_dim = required_u32(m, "hy_v3.attention.key_length");
-    const uint32_t n_rot = required_u32(m, "hy_v3.rope.dimension_count");
-    const uint32_t n_expert = required_u32(m, "hy_v3.expert_count");
-    const uint32_t n_expert_used = required_u32(m, "hy_v3.expert_used_count");
-    const uint32_t n_ff_exp = required_u32(m, "hy_v3.expert_feed_forward_length");
-    const uint32_t n_expert_shared = required_u32(m, "hy_v3.expert_shared_count");
-    const uint32_t n_leading_dense = required_u32(m, "hy_v3.leading_dense_block_count");
-    const uint32_t n_nextn = required_u32(m, "hy_v3.nextn_predict_layers");
+    const uint32_t n_layer = required_u32(m, "hy-v3.block_count");
+    const uint64_t n_ctx = required_u64_compat(m, "hy-v3.context_length");
+    const uint32_t n_embd = required_u32(m, "hy-v3.embedding_length");
+    /* llama.cpp-converted hy-v3 ggufs carry no <arch>.vocab_size key (the
+     * vocab is implied by the tokenizer arrays); fall back to the model's. */
+    uint32_t n_vocab = 120832;
+    (void)model_get_u32(m, "hy-v3.vocab_size", &n_vocab);
+    const uint32_t n_ff_dense = required_u32(m, "hy-v3.feed_forward_length");
+    const uint32_t n_head = required_u32(m, "hy-v3.attention.head_count");
+    const uint32_t n_head_kv = required_u32(m, "hy-v3.attention.head_count_kv");
+    const uint32_t n_head_dim = required_u32(m, "hy-v3.attention.key_length");
+    const uint32_t n_rot = required_u32(m, "hy-v3.rope.dimension_count");
+    const uint32_t n_expert = required_u32(m, "hy-v3.expert_count");
+    const uint32_t n_expert_used = required_u32(m, "hy-v3.expert_used_count");
+    const uint32_t n_ff_exp = required_u32(m, "hy-v3.expert_feed_forward_length");
+    const uint32_t n_expert_shared = required_u32(m, "hy-v3.expert_shared_count");
+    const uint32_t n_leading_dense = required_u32(m, "hy-v3.leading_dense_block_count");
+    const uint32_t n_nextn = required_u32(m, "hy-v3.nextn_predict_layers");
 
     config_expect_u32("block_count", n_layer, DS4_N_LAYER);
     config_expect_u64("context_length", n_ctx, DS4_ROPE_ORIG_CTX);
@@ -4884,14 +4887,14 @@ static void config_validate_hy_v3_model(const ds4_model *m) {
     config_expect_u32("leading_dense_block_count", n_leading_dense, DS4_N_LEADING_DENSE);
     config_expect_u32("nextn_predict_layers", n_nextn, DS4_N_NEXTN_PREDICT);
 
-    const float rope_freq_base = required_f32(m, "hy_v3.rope.freq_base");
+    const float rope_freq_base = required_f32(m, "hy-v3.rope.freq_base");
     config_expect_f32("rope.freq_base", rope_freq_base, DS4_ROPE_FREQ_BASE);
-    const float rms_eps = required_f32(m, "hy_v3.attention.layer_norm_rms_epsilon");
+    const float rms_eps = required_f32(m, "hy-v3.attention.layer_norm_rms_epsilon");
     config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
-    const float expert_weight_scale = required_f32(m, "hy_v3.expert_weights_scale");
+    const float expert_weight_scale = required_f32(m, "hy-v3.expert_weights_scale");
     config_expect_f32("expert_weights_scale", expert_weight_scale, DS4_EXPERT_WEIGHT_SCALE);
     /* Sigmoid routing with post-top-k weight normalization (route_norm). */
-    const bool expert_weight_norm = required_bool(m, "hy_v3.expert_weights_norm");
+    const bool expert_weight_norm = required_bool(m, "hy-v3.expert_weights_norm");
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 }
 
@@ -4902,7 +4905,7 @@ static void config_validate_model(const ds4_model *m) {
             config_validate_glm_dsa_model(m);
             return;
         }
-        if (ds4_streq(arch, "hy_v3")) {
+        if (ds4_streq(arch, "hy-v3")) {
             config_validate_hy_v3_model(m);
             return;
         }
@@ -34246,6 +34249,380 @@ static int generate_glm_metal_argmax(
     return 0;
 }
 
+/* ---- Hy3 (hy_v3) CUDA inference -------------------------------------
+ * Straight-line per-token forward, no graph machinery: Hy3 is plain GQA
+ * (no MLA latents, no indexer, no compressed KV), so the whole decode is
+ * existing Q8_0 matmul / rmsnorm primitives, the ds4_cuda_gqa.inc kernels,
+ * and the GLM streaming MoE machinery called with Hy3 dimensions.
+ * ponytail: token-major prefill (one forward per prompt token); batch
+ * prefill is a later workstream, same as GLM's was. */
+
+typedef struct hy3_gpu_state {
+    uint32_t ctx;
+    uint32_t n_exec_layer;
+    ds4_gpu_tensor *tok;         /* i32 [1] */
+    ds4_gpu_tensor *cur;         /* f32 [embd] residual stream */
+    ds4_gpu_tensor *attn_norm;   /* f32 [embd] */
+    ds4_gpu_tensor *q;           /* f32 [64*128] */
+    ds4_gpu_tensor *k;           /* f32 [8*128] */
+    ds4_gpu_tensor *v;           /* f32 [8*128] */
+    ds4_gpu_tensor *heads;       /* f32 [64*128] */
+    ds4_gpu_tensor *attn_out;    /* f32 [embd] */
+    ds4_gpu_tensor *after_attn;  /* f32 [embd] */
+    ds4_gpu_tensor *ffn_norm;    /* f32 [embd] */
+    ds4_gpu_tensor *dense_gate;  /* f32 [ff_dense] */
+    ds4_gpu_tensor *dense_up;    /* f32 [ff_dense] */
+    ds4_gpu_tensor *dense_mid;   /* f32 [ff_dense] */
+    ds4_gpu_tensor *shared_mid;  /* f32 [ff_exp] */
+    ds4_gpu_tensor *shared_out;  /* f32 [embd] */
+    ds4_gpu_tensor *router_logits;   /* f32 [n_expert] */
+    ds4_gpu_tensor *router_probs;    /* f32 [n_expert] */
+    ds4_gpu_tensor *router_selected; /* i32 [n_expert_used] */
+    ds4_gpu_tensor *router_weights;  /* f32 [n_expert_used] */
+    ds4_gpu_tensor *routed_gate; /* f32 [used*ff_exp] */
+    ds4_gpu_tensor *routed_up;   /* f32 [used*ff_exp] */
+    ds4_gpu_tensor *routed_mid;  /* f32 [used*ff_exp] */
+    ds4_gpu_tensor *routed_down; /* f32 [used*embd] */
+    ds4_gpu_tensor *routed_out;  /* f32 [embd] */
+    ds4_gpu_tensor *out_norm;    /* f32 [embd] */
+    ds4_gpu_tensor *logits;      /* f32 [vocab] */
+    /* per executable layer */
+    ds4_gpu_tensor **kcache;     /* f32 [n_head_kv][ctx][head_dim] */
+    ds4_gpu_tensor **vcache;
+    ds4_gpu_tensor **qn;         /* f32 [head_dim] qk-norm weights */
+    ds4_gpu_tensor **kn;
+    bool ssd_streaming;
+} hy3_gpu_state;
+
+static void hy3_state_free(hy3_gpu_state *s) {
+    if (!s) return;
+    ds4_gpu_tensor_free(s->tok); ds4_gpu_tensor_free(s->cur);
+    ds4_gpu_tensor_free(s->attn_norm);
+    ds4_gpu_tensor_free(s->q); ds4_gpu_tensor_free(s->k);
+    ds4_gpu_tensor_free(s->v); ds4_gpu_tensor_free(s->heads);
+    ds4_gpu_tensor_free(s->attn_out); ds4_gpu_tensor_free(s->after_attn);
+    ds4_gpu_tensor_free(s->ffn_norm);
+    ds4_gpu_tensor_free(s->dense_gate); ds4_gpu_tensor_free(s->dense_up);
+    ds4_gpu_tensor_free(s->dense_mid);
+    ds4_gpu_tensor_free(s->shared_mid); ds4_gpu_tensor_free(s->shared_out);
+    ds4_gpu_tensor_free(s->router_logits); ds4_gpu_tensor_free(s->router_probs);
+    ds4_gpu_tensor_free(s->router_selected); ds4_gpu_tensor_free(s->router_weights);
+    ds4_gpu_tensor_free(s->routed_gate); ds4_gpu_tensor_free(s->routed_up);
+    ds4_gpu_tensor_free(s->routed_mid); ds4_gpu_tensor_free(s->routed_down);
+    ds4_gpu_tensor_free(s->routed_out);
+    ds4_gpu_tensor_free(s->out_norm); ds4_gpu_tensor_free(s->logits);
+    for (uint32_t il = 0; s->kcache && il < s->n_exec_layer; il++) {
+        ds4_gpu_tensor_free(s->kcache[il]);
+        ds4_gpu_tensor_free(s->vcache[il]);
+        ds4_gpu_tensor_free(s->qn[il]);
+        ds4_gpu_tensor_free(s->kn[il]);
+    }
+    free(s->kcache); free(s->vcache); free(s->qn); free(s->kn);
+    memset(s, 0, sizeof(*s));
+}
+
+static bool hy3_state_alloc(
+        hy3_gpu_state     *s,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           ctx,
+        bool               ssd_streaming) {
+    memset(s, 0, sizeof(*s));
+    s->ctx = ctx;
+    s->n_exec_layer = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    s->ssd_streaming = ssd_streaming;
+    const uint64_t embd = DS4_N_EMBD;
+    const uint64_t hd = DS4_N_HEAD_DIM;
+    s->tok = ds4_gpu_tensor_alloc(sizeof(int32_t));
+    s->cur = ds4_gpu_tensor_alloc(embd * sizeof(float));
+    s->attn_norm = ds4_gpu_tensor_alloc(embd * sizeof(float));
+    s->q = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD * hd * sizeof(float));
+    s->k = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_KV * hd * sizeof(float));
+    s->v = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_KV * hd * sizeof(float));
+    s->heads = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD * hd * sizeof(float));
+    s->attn_out = ds4_gpu_tensor_alloc(embd * sizeof(float));
+    s->after_attn = ds4_gpu_tensor_alloc(embd * sizeof(float));
+    s->ffn_norm = ds4_gpu_tensor_alloc(embd * sizeof(float));
+    s->dense_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_FF_DENSE * sizeof(float));
+    s->dense_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_FF_DENSE * sizeof(float));
+    s->dense_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_FF_DENSE * sizeof(float));
+    s->shared_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_FF_EXP * sizeof(float));
+    s->shared_out = ds4_gpu_tensor_alloc(embd * sizeof(float));
+    s->router_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    s->router_probs = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    s->router_selected = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+    s->router_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+    s->routed_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+    s->routed_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+    s->routed_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+    s->routed_down = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * embd * sizeof(float));
+    s->routed_out = ds4_gpu_tensor_alloc(embd * sizeof(float));
+    s->out_norm = ds4_gpu_tensor_alloc(embd * sizeof(float));
+    s->logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_VOCAB * sizeof(float));
+    if (!s->tok || !s->cur || !s->attn_norm || !s->q || !s->k || !s->v ||
+        !s->heads || !s->attn_out || !s->after_attn || !s->ffn_norm ||
+        !s->dense_gate || !s->dense_up || !s->dense_mid ||
+        !s->shared_mid || !s->shared_out ||
+        !s->router_logits || !s->router_probs || !s->router_selected ||
+        !s->router_weights || !s->routed_gate || !s->routed_up ||
+        !s->routed_mid || !s->routed_down || !s->routed_out ||
+        !s->out_norm || !s->logits) {
+        hy3_state_free(s);
+        return false;
+    }
+    s->kcache = xcalloc(s->n_exec_layer, sizeof(s->kcache[0]));
+    s->vcache = xcalloc(s->n_exec_layer, sizeof(s->vcache[0]));
+    s->qn = xcalloc(s->n_exec_layer, sizeof(s->qn[0]));
+    s->kn = xcalloc(s->n_exec_layer, sizeof(s->kn[0]));
+    const uint64_t cache_bytes =
+        (uint64_t)DS4_N_HEAD_KV * ctx * hd * sizeof(float);
+    for (uint32_t il = 0; il < s->n_exec_layer; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        s->kcache[il] = ds4_gpu_tensor_alloc(cache_bytes);
+        s->vcache[il] = ds4_gpu_tensor_alloc(cache_bytes);
+        s->qn[il] = ds4_gpu_tensor_alloc(hd * sizeof(float));
+        s->kn[il] = ds4_gpu_tensor_alloc(hd * sizeof(float));
+        if (!s->kcache[il] || !s->vcache[il] || !s->qn[il] || !s->kn[il] ||
+            ds4_gpu_tensor_write(s->qn[il], 0,
+                                 tensor_data(model, l->attn_q_norm),
+                                 hd * sizeof(float)) == 0 ||
+            ds4_gpu_tensor_write(s->kn[il], 0,
+                                 tensor_data(model, l->attn_k_norm),
+                                 hd * sizeof(float)) == 0) {
+            hy3_state_free(s);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* One full forward for one token at absolute position pos.  Reads the
+ * embedding, runs every executable layer, and (optionally) produces host
+ * logits.  The residual stream lives in s->cur throughout. */
+static bool hy3_forward_token(
+        hy3_gpu_state     *s,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        int                token,
+        uint32_t           pos,
+        float             *logits_out) {
+    const int32_t tok32 = (int32_t)token;
+    if (pos >= s->ctx) return false;
+    if (ds4_gpu_tensor_write(s->tok, 0, &tok32, sizeof(tok32)) == 0) return false;
+    bool ok = ds4_gpu_embed_tokens_q8_0_tensor(s->cur,
+                                               s->tok,
+                                               model->map,
+                                               model->size,
+                                               weights->token_embd->abs_offset,
+                                               DS4_N_VOCAB,
+                                               1,
+                                               DS4_N_EMBD) != 0;
+    for (uint32_t il = 0; ok && il < s->n_exec_layer; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        /* attention */
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(s->attn_norm, s->cur,
+                model->map, model->size, l->attn_norm->abs_offset,
+                DS4_N_EMBD, 1, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->q, model->map, model->size,
+                l->attn_q->abs_offset, DS4_N_EMBD,
+                (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM, s->attn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->k, model->map, model->size,
+                l->attn_k->abs_offset, DS4_N_EMBD,
+                (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM, s->attn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->v, model->map, model->size,
+                l->attn_v->abs_offset, DS4_N_EMBD,
+                (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM, s->attn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_gqa_head_rms_norm_weight(s->q, s->qn[il],
+                DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_gqa_head_rms_norm_weight(s->k, s->kn[il],
+                DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_gqa_rope(s->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                pos, DS4_ROPE_FREQ_BASE) != 0;
+        if (ok) ok = ds4_gpu_gqa_rope(s->k, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                pos, DS4_ROPE_FREQ_BASE) != 0;
+        if (ok) ok = ds4_gpu_gqa_kv_cache_append(s->kcache[il], s->k, 1,
+                DS4_N_HEAD_KV, DS4_N_HEAD_DIM, s->ctx, pos) != 0;
+        if (ok) ok = ds4_gpu_gqa_kv_cache_append(s->vcache[il], s->v, 1,
+                DS4_N_HEAD_KV, DS4_N_HEAD_DIM, s->ctx, pos) != 0;
+        if (ok) ok = ds4_gpu_gqa_attention(s->heads, s->q,
+                s->kcache[il], s->vcache[il], 1,
+                DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, s->ctx, pos) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->attn_out, model->map,
+                model->size, l->attn_output->abs_offset,
+                (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM, DS4_N_EMBD,
+                s->heads, 1) != 0;
+        if (ok) ok = ds4_gpu_add_tensor(s->after_attn, s->cur, s->attn_out,
+                DS4_N_EMBD) != 0;
+        /* ffn */
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(s->ffn_norm,
+                s->after_attn, model->map, model->size,
+                l->ffn_norm->abs_offset, DS4_N_EMBD, 1, DS4_RMS_EPS) != 0;
+        if (!ok) break;
+        if (il < DS4_N_LEADING_DENSE) {
+            ok = ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
+                    s->dense_gate, s->dense_up, s->dense_mid,
+                    model->map, model->size,
+                    l->ffn_gate->abs_offset, l->ffn_up->abs_offset,
+                    DS4_N_EMBD, DS4_N_FF_DENSE, s->ffn_norm, 0.0f) != 0;
+            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->routed_out,
+                    model->map, model->size, l->ffn_down->abs_offset,
+                    DS4_N_FF_DENSE, DS4_N_EMBD, s->dense_mid, 1) != 0;
+            if (ok) ok = ds4_gpu_add_tensor(s->cur, s->after_attn,
+                    s->routed_out, DS4_N_EMBD) != 0;
+            continue;
+        }
+        /* router: sigmoid + bias select, route-norm weights * scale */
+        ok = ds4_gpu_matmul_f32_tensor(s->router_logits, model->map,
+                model->size, l->ffn_gate_inp->abs_offset,
+                DS4_N_EMBD, DS4_N_EXPERT, s->ffn_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_glm_router_select_tensor(s->router_selected,
+                s->router_weights, s->router_probs, model->map, model->size,
+                l->ffn_exp_probs_b->abs_offset, s->router_logits,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE) != 0;
+        uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
+        uint64_t up_in = 0, up_out = 0, up_row_bytes = 0;
+        uint64_t down_in = 0, down_out = 0, down_row_bytes = 0;
+        (void)tensor_expert_bytes(model, l->ffn_gate_exps, 0, &gate_in, &gate_out, &gate_row_bytes);
+        (void)tensor_expert_bytes(model, l->ffn_up_exps, 0, &up_in, &up_out, &up_row_bytes);
+        (void)tensor_expert_bytes(model, l->ffn_down_exps, 0, &down_in, &down_out, &down_row_bytes);
+        if (ok && s->ssd_streaming) {
+            const ds4_gpu_stream_expert_table table = {
+                .model_map = model->map,
+                .model_size = model->size,
+                .layer = il,
+                .n_total_expert = DS4_N_EXPERT,
+                .gate_offset = l->ffn_gate_exps->abs_offset,
+                .up_offset = l->ffn_up_exps->abs_offset,
+                .down_offset = l->ffn_down_exps->abs_offset,
+                .gate_expert_bytes = gate_out * gate_row_bytes,
+                .down_expert_bytes = down_out * down_row_bytes,
+            };
+            ok = ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+                    &table, s->router_selected, DS4_N_EXPERT_USED) != 0;
+        }
+        /* shared expert */
+        if (ok) ok = ds4_gpu_shared_mid_swiglu_q8_0_tensor(s->shared_mid,
+                model->map, model->size,
+                l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                DS4_N_EMBD, DS4_N_FF_EXP, s->ffn_norm, 0.0f) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->shared_out, model->map,
+                model->size, l->ffn_down_shexp->abs_offset,
+                DS4_N_FF_EXP, DS4_N_EMBD, s->shared_mid, 1) != 0;
+        /* routed experts (streaming selected cache picked up inside) */
+        if (ok) ok = ds4_gpu_routed_moe_one_tensor(s->routed_out,
+                s->routed_gate, s->routed_up, s->routed_mid, s->routed_down,
+                model->map, model->size,
+                l->ffn_gate_exps->abs_offset,
+                l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset,
+                l->ffn_gate_exps->type,
+                l->ffn_down_exps->type,
+                gate_out * gate_row_bytes, gate_row_bytes,
+                down_out * down_row_bytes, down_row_bytes,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                s->router_selected, s->router_weights,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                0.0f, s->ffn_norm, il, false) != 0;
+        if (ok) ok = ds4_gpu_add3_tensor(s->cur, s->after_attn,
+                s->routed_out, s->shared_out, DS4_N_EMBD) != 0;
+    }
+    if (ok && logits_out) {
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(s->out_norm, s->cur,
+                model->map, model->size, weights->output_norm->abs_offset,
+                DS4_N_EMBD, 1, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->logits, model->map,
+                model->size, weights->output->abs_offset,
+                DS4_N_EMBD, DS4_N_VOCAB, s->out_norm, 1) != 0;
+        if (ok) ok = ds4_gpu_tensor_read(s->logits, 0, logits_out,
+                (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    return ok;
+}
+
+static int generate_hy3_cuda_argmax(
+        const ds4_model   * model,
+        const ds4_vocab   * vocab,
+        const ds4_weights * weights,
+        const token_vec   * prompt,
+        int                 n_predict,
+        int                 ctx_size,
+        bool                ssd_streaming,
+        ds4_token_emit_fn   emit,
+        ds4_generation_done_fn done,
+        void              * emit_ud,
+        ds4_session_progress_fn progress,
+        void              * progress_ud) {
+    fprintf(stderr, "ds4: using Hy3 CUDA argmax generation path\n");
+    if (!prompt || prompt->len <= 0 || prompt->len >= ctx_size) {
+        fprintf(stderr, "ds4: prompt is empty or exceeds context size\n");
+        return 1;
+    }
+    if (n_predict <= 0) {
+        if (done) done(emit_ud);
+        return 0;
+    }
+    hy3_gpu_state s;
+    if (!hy3_state_alloc(&s, model, weights, (uint32_t)ctx_size, ssd_streaming)) {
+        fprintf(stderr, "ds4: failed to allocate Hy3 CUDA state\n");
+        return 1;
+    }
+    float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
+    bool ok = true;
+    const double t_prefill0 = now_sec();
+    for (int i = 0; ok && i < prompt->len; i++) {
+        const bool last = i + 1 == prompt->len;
+        ok = hy3_forward_token(&s, model, weights, prompt->v[i],
+                               (uint32_t)i, last ? logits : NULL);
+        if (progress) progress(progress_ud, "prefill_chunk", i + 1, prompt->len);
+    }
+    const double t_prefill1 = now_sec();
+    if (!ok) {
+        fprintf(stderr, "ds4: Hy3 prefill failed\n");
+        free(logits);
+        hy3_state_free(&s);
+        return 1;
+    }
+    int n_generated = 0;
+    uint32_t pos = (uint32_t)prompt->len;
+    const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+    const double t_decode0 = now_sec();
+    for (int i = 0; i < n_predict && pos < s.ctx; i++) {
+        const int token = sample_argmax(logits, DS4_N_VOCAB);
+        if (vocab_token_is_generation_stop(vocab, token)) break;
+        if (emit) emit(emit_ud, token);
+        n_generated++;
+        if (i == n_predict - 1 || pos + 1u >= s.ctx) {
+            pos++;
+            break;
+        }
+        const double t_eval0 = token_timing ? now_sec() : 0.0;
+        ok = hy3_forward_token(&s, model, weights, token, pos, logits);
+        if (!ok) {
+            fprintf(stderr, "ds4: Hy3 decode failed at position %u\n", pos);
+            free(logits);
+            hy3_state_free(&s);
+            return 1;
+        }
+        if (token_timing) {
+            fprintf(stderr, "ds4: Hy3 decode eval %d took %.3f ms\n",
+                    i + 1, (now_sec() - t_eval0) * 1000.0);
+        }
+        pos++;
+    }
+    const double t_decode1 = now_sec();
+    if (done) done(emit_ud);
+    const double prefill_s = t_prefill1 - t_prefill0;
+    const double decode_s = t_decode1 - t_decode0;
+    ds4_log(stderr,
+            DS4_LOG_TIMING,
+            "ds4: Hy3 prefill: %.2f t/s, generation: %.2f t/s\n",
+            prefill_s > 0.0 ? (double)prompt->len / prefill_s : 0.0,
+            decode_s > 0.0 ? (double)n_generated / decode_s : 0.0);
+    free(logits);
+    hy3_state_free(&s);
+    return 0;
+}
+
 /* Metal generation entry point.  The model runs as one local whole-graph
  * pipeline: graph prefill followed by graph decode steps.  Streaming PRO may
  * use decode-style prefill for short prompts. */
@@ -34275,6 +34652,22 @@ static int generate_metal_graph_raw_swa(
     if (prompt->len <= 0 || prompt->len > ctx_size) {
         fprintf(stderr, "ds4: prompt is empty or exceeds context size\n");
         return 1;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3) {
+        /* ponytail: no --power/--prefill-chunk/steering support in v1; the
+         * straight-line path ignores them rather than growing option glue. */
+        return generate_hy3_cuda_argmax(model,
+                                        vocab,
+                                        weights,
+                                        prompt,
+                                        n_predict,
+                                        ctx_size,
+                                        ssd_streaming,
+                                        emit,
+                                        done,
+                                        emit_ud,
+                                        progress,
+                                        progress_ud);
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (power_percent > 0 && power_percent < 100) {
@@ -39606,18 +39999,25 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                  load_layer_end,
                  load_output);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3) {
-        if (opt->inspect_only) {
-            *out = e;
-            return 0;
+        if (!opt->inspect_only) {
+            if (e->backend != DS4_BACKEND_CUDA ||
+                !ds4_backend_uses_graph(e->backend)) {
+                fprintf(stderr,
+                        "ds4: Hy3 (hy_v3) inference is CUDA-only in this "
+                        "fork; use --cuda or --inspect\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (opt->mtp_path && opt->mtp_path[0]) {
+                fprintf(stderr, "ds4: --mtp is not wired for Hy3 yet\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
-        /* Loader and GQA kernels exist; the graph/inference wiring does not
-         * yet. Fail honestly instead of running a wrong family path. */
-        fprintf(stderr,
-                "ds4: Hy3 (hy_v3) tensor layout is recognized, but Hy3 "
-                "inference is not wired yet; use --inspect\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
+        /* fall through: the generic tail below handles vocab_load,
+         * streaming budgets, and inspect_only. */
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (opt->inspect_only) {
