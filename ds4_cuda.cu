@@ -14753,3 +14753,4 @@ extern "C" int ds4_gpu_embed_tokens_q8_0_tensor(
 #include "ds4_cuda_glm_attn.inc"
 #include "ds4_cuda_glm_moe.inc"
 #include "ds4_cuda_glm_stubs.inc"
+#include "ds4_cuda_gqa.inc"

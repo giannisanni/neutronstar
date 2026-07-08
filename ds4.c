@@ -111,14 +111,14 @@ static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
  */
 
 enum {
-    DS4_MAX_LAYER            = 79,
+    DS4_MAX_LAYER            = 81,
     DS4_MAX_EMBD             = 7168,
     DS4_MAX_VOCAB            = 154880,
     DS4_MAX_HEAD             = 128,
-    DS4_MAX_HEAD_KV          = 1,
+    DS4_MAX_HEAD_KV          = 8,
     DS4_MAX_HEAD_DIM         = 576,
     DS4_MAX_VALUE_DIM        = 512,
-    DS4_MAX_ROT              = 64,
+    DS4_MAX_ROT              = 128,
     DS4_MAX_OUT_GROUP        = 16,
     DS4_MAX_LORA_Q           = 2048,
     DS4_MAX_LORA_O           = 1024,
@@ -138,12 +138,14 @@ enum {
 typedef enum {
     DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
+    DS4_MODEL_FAMILY_HY_V3     = 2,
 } ds4_model_family;
 
 typedef enum {
     DS4_VARIANT_FLASH = 0,
     DS4_VARIANT_PRO   = 1,
     DS4_VARIANT_GLM52 = 2,
+    DS4_VARIANT_HY3   = 3,
 } ds4_variant;
 
 typedef struct {
@@ -308,6 +310,55 @@ static const ds4_shape DS4_SHAPE_GLM52 = {
     .rope_yarn_beta_slow = 0.0f,
     .compress_rope_freq_base = 0.0f,
     .rope_orig_ctx = 1048576,
+};
+
+/* Tencent Hy3 (hy_v3): plain GQA attention (no MLA, no indexer), 80
+ * transformer layers plus 1 nextn MTP layer bound like GLM's. n_head_dim
+ * doubles as the GQA head_dim for q/k/v; n_rot = head_dim (full-head
+ * rotate-half RoPE, no yarn). expert_weight_scale carries the config's
+ * router_scaling_factor; sigmoid routing with expert bias mirrors GLM. */
+static const ds4_shape DS4_SHAPE_HY3 = {
+    .name = "Hy3",
+    .family = DS4_MODEL_FAMILY_HY_V3,
+    .variant = DS4_VARIANT_HY3,
+    .n_layer = 81,
+    .n_embd = 4096,
+    .n_vocab = 120832,
+    .n_head = 64,
+    .n_head_kv = 8,
+    .n_head_dim = 128,
+    .n_value_dim = 128,
+    .n_rot = 128,
+    .n_out_group = 0,
+    .n_lora_q = 0,
+    .n_lora_o = 0,
+    .n_expert = 192,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 1536,
+    .n_ff_dense = 13312,
+    .n_hash_layer = 0,
+    .n_swa = 0,
+    .n_indexer_head = 0,
+    .n_indexer_head_dim = 0,
+    .n_indexer_top_k = 0,
+    .n_hc = 0,
+    .n_hc_sinkhorn_iter = 0,
+    .n_nextn_predict = 1,
+    .n_leading_dense = 1,
+    .n_kv_lora = 0,
+    .n_key_mla = 0,
+    .n_value_mla = 0,
+    .rms_eps = 1.0e-5f,
+    .hc_eps = 0.0f,
+    .expert_weight_scale = 2.826f,
+    .swiglu_clamp_exp = 0.0f,
+    .rope_freq_base = 11158840.0f,
+    .rope_scale_factor = 1.0f,
+    .rope_yarn_beta_fast = 0.0f,
+    .rope_yarn_beta_slow = 0.0f,
+    .compress_rope_freq_base = 0.0f,
+    .rope_orig_ctx = 262144,
 };
 
 static ds4_shape g_ds4_shape = {
@@ -3406,6 +3457,12 @@ typedef struct {
     ds4_tensor *hc_attn_scale;
     ds4_tensor *hc_attn_base;
     ds4_tensor *attn_norm;
+    /* GQA families (hy_v3): direct q/k/v projections + per-head qk norms. */
+    ds4_tensor *attn_q;
+    ds4_tensor *attn_k;
+    ds4_tensor *attn_v;
+    ds4_tensor *attn_q_norm;
+    ds4_tensor *attn_k_norm;
     ds4_tensor *attn_q_a;
     ds4_tensor *attn_q_a_norm;
     ds4_tensor *attn_q_b;
@@ -3942,7 +3999,7 @@ static void tensor_expect_routed_expert(
 }
 
 static bool weights_have_output_head(const ds4_weights *w) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         return w && w->output_norm && w->output;
     }
     return w &&
@@ -3954,7 +4011,7 @@ static bool weights_have_output_head(const ds4_weights *w) {
 }
 
 static bool weights_have_partial_output_head(const ds4_weights *w) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         return w && (w->output_norm || w->output);
     }
     return w &&
@@ -4174,6 +4231,77 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
+static void weights_validate_hy_v3_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+
+    if (!w) ds4_die("internal error: missing weights while validating hy_v3 layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in hy_v3 weight layout validation");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) {
+        ds4_die("invalid layer range in hy_v3 weight layout validation");
+    }
+
+    if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
+    if (w->token_embd) {
+        tensor_expect_layout(w->token_embd, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    const bool have_output = weights_have_output_head(w);
+    if (require_output && !have_output) ds4_die("required output head tensors are missing");
+    if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
+    if (have_output) {
+        tensor_expect_layout(w->output_norm, DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(w->output,      DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!l->attn_norm) continue; /* unbound MTP tail layer without nextn block */
+
+        tensor_expect_layout(l->attn_norm,   DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+        tensor_expect_layout(l->attn_q,      DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, q_dim, 0);
+        tensor_expect_layout(l->attn_k,      DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_layout(l->attn_v,      DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, kv_dim, 0);
+        tensor_expect_layout(l->attn_q_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->attn_k_norm, DS4_TENSOR_F32,  1, DS4_N_HEAD_DIM, 0, 0);
+        tensor_expect_layout(l->attn_output, DS4_TENSOR_Q8_0, 2, q_dim, DS4_N_EMBD, 0);
+        tensor_expect_layout(l->ffn_norm,    DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+
+        if (il < DS4_N_LEADING_DENSE) {
+            tensor_expect_layout(l->ffn_gate, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+            tensor_expect_layout(l->ffn_up,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_DENSE, 0);
+            tensor_expect_layout(l->ffn_down, DS4_TENSOR_Q8_0, 2, DS4_N_FF_DENSE, DS4_N_EMBD, 0);
+        } else {
+            tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+            tensor_expect_layout(l->ffn_exp_probs_b, DS4_TENSOR_F32, 1, DS4_N_EXPERT, 0, 0);
+            tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            tensor_expect_routed_expert(l->ffn_up_exps,   3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+            tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+            if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
+                fprintf(stderr, "ds4: hy_v3 routed gate/up experts use different quant types in layer %u\n", il);
+                exit(1);
+            }
+            tensor_expect_layout(l->ffn_gate_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+            tensor_expect_layout(l->ffn_up_shexp,   DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+            tensor_expect_layout(l->ffn_down_shexp, DS4_TENSOR_Q8_0, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+        }
+
+        if (DS4_N_NEXTN_PREDICT != 0 &&
+            il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER) {
+            tensor_expect_layout(l->nextn_eh_proj, DS4_TENSOR_Q8_0, 2, 2u * DS4_N_EMBD, DS4_N_EMBD, 0);
+            tensor_expect_layout(l->nextn_enorm,   DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+            tensor_expect_layout(l->nextn_hnorm,   DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
+            tensor_expect_layout(l->nextn_shared_head_norm, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        }
+    }
+}
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
@@ -4186,6 +4314,14 @@ static void weights_validate_layout(
                                         layer_end,
                                         require_token_embd,
                                         require_output);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3) {
+        weights_validate_hy_v3_layout(w,
+                                      layer_start,
+                                      layer_end,
+                                      require_token_embd,
+                                      require_output);
         return;
     }
 
@@ -4712,18 +4848,70 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 }
 
+static void config_validate_hy_v3_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_HY3;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint32_t n_layer = required_u32(m, "hy_v3.block_count");
+    const uint64_t n_ctx = required_u64_compat(m, "hy_v3.context_length");
+    const uint32_t n_embd = required_u32(m, "hy_v3.embedding_length");
+    const uint32_t n_vocab = required_u32(m, "hy_v3.vocab_size");
+    const uint32_t n_ff_dense = required_u32(m, "hy_v3.feed_forward_length");
+    const uint32_t n_head = required_u32(m, "hy_v3.attention.head_count");
+    const uint32_t n_head_kv = required_u32(m, "hy_v3.attention.head_count_kv");
+    const uint32_t n_head_dim = required_u32(m, "hy_v3.attention.key_length");
+    const uint32_t n_rot = required_u32(m, "hy_v3.rope.dimension_count");
+    const uint32_t n_expert = required_u32(m, "hy_v3.expert_count");
+    const uint32_t n_expert_used = required_u32(m, "hy_v3.expert_used_count");
+    const uint32_t n_ff_exp = required_u32(m, "hy_v3.expert_feed_forward_length");
+    const uint32_t n_expert_shared = required_u32(m, "hy_v3.expert_shared_count");
+    const uint32_t n_leading_dense = required_u32(m, "hy_v3.leading_dense_block_count");
+    const uint32_t n_nextn = required_u32(m, "hy_v3.nextn_predict_layers");
+
+    config_expect_u32("block_count", n_layer, DS4_N_LAYER);
+    config_expect_u64("context_length", n_ctx, DS4_ROPE_ORIG_CTX);
+    config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
+    config_expect_u32("vocab_size", n_vocab, DS4_N_VOCAB);
+    config_expect_u32("feed_forward_length", n_ff_dense, DS4_N_FF_DENSE);
+    config_expect_u32("attention.head_count", n_head, DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv", n_head_kv, DS4_N_HEAD_KV);
+    config_expect_u32("attention.key_length", n_head_dim, DS4_N_HEAD_DIM);
+    config_expect_u32("rope.dimension_count", n_rot, DS4_N_ROT);
+    config_expect_u32("expert_count", n_expert, DS4_N_EXPERT);
+    config_expect_u32("expert_used_count", n_expert_used, DS4_N_EXPERT_USED);
+    config_expect_u32("expert_feed_forward_length", n_ff_exp, DS4_N_FF_EXP);
+    config_expect_u32("expert_shared_count", n_expert_shared, DS4_N_EXPERT_SHARED);
+    config_expect_u32("leading_dense_block_count", n_leading_dense, DS4_N_LEADING_DENSE);
+    config_expect_u32("nextn_predict_layers", n_nextn, DS4_N_NEXTN_PREDICT);
+
+    const float rope_freq_base = required_f32(m, "hy_v3.rope.freq_base");
+    config_expect_f32("rope.freq_base", rope_freq_base, DS4_ROPE_FREQ_BASE);
+    const float rms_eps = required_f32(m, "hy_v3.attention.layer_norm_rms_epsilon");
+    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
+    const float expert_weight_scale = required_f32(m, "hy_v3.expert_weights_scale");
+    config_expect_f32("expert_weights_scale", expert_weight_scale, DS4_EXPERT_WEIGHT_SCALE);
+    /* Sigmoid routing with post-top-k weight normalization (route_norm). */
+    const bool expert_weight_norm = required_bool(m, "hy_v3.expert_weights_norm");
+    config_expect_bool("expert_weights_norm", expert_weight_norm, true);
+}
+
 static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
-    if (model_get_string(m, "general.architecture", &arch) &&
-        ds4_streq(arch, "glm-dsa")) {
-        config_validate_glm_dsa_model(m);
-        return;
+    if (model_get_string(m, "general.architecture", &arch)) {
+        if (ds4_streq(arch, "glm-dsa")) {
+            config_validate_glm_dsa_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "hy_v3")) {
+            config_validate_hy_v3_model(m);
+            return;
+        }
     }
     config_validate_deepseek4_model(m);
 }
 
 static void weights_bind_output(ds4_weights *w, const ds4_model *m, bool required) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
             w->output      = required_tensor(m, "output.weight");
@@ -4782,9 +4970,69 @@ static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m,
     }
 }
 
+/* hy_v3 GGUF tensor-name contract (defined here; our converter emits it,
+ * llama.cpp-style names):
+ *   token_embd.weight, output_norm.weight, output.weight
+ *   blk.N.attn_norm.weight
+ *   blk.N.attn_q.weight        [4096 -> 64*128]
+ *   blk.N.attn_k.weight        [4096 -> 8*128]
+ *   blk.N.attn_v.weight        [4096 -> 8*128]
+ *   blk.N.attn_q_norm.weight   [128] per-head RMSNorm weight
+ *   blk.N.attn_k_norm.weight   [128]
+ *   blk.N.attn_output.weight   [64*128 -> 4096]
+ *   blk.N.ffn_norm.weight
+ *   dense layer (il < leading_dense=1):
+ *     blk.N.ffn_gate.weight / ffn_up.weight / ffn_down.weight   [13312]
+ *   MoE layers:
+ *     blk.N.ffn_gate_inp.weight            router [4096 -> 192]
+ *     blk.N.exp_probs_b.bias               expert bias [192]
+ *     blk.N.ffn_{gate,up,down}_exps.weight [192 experts, ff 1536]
+ *     blk.N.ffn_{gate,up,down}_shexp.weight  shared expert
+ *   MTP layer (blk.80): the regular names above plus
+ *     blk.N.nextn.eh_proj.weight / nextn.enorm.weight / nextn.hnorm.weight /
+ *     nextn.shared_head_norm.weight (same glue contract as GLM). */
+static void weights_bind_hy_v3_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->attn_norm   = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+    l->attn_q      = required_tensorf(m, "blk.%u.attn_q.weight", il);
+    l->attn_k      = required_tensorf(m, "blk.%u.attn_k.weight", il);
+    l->attn_v      = required_tensorf(m, "blk.%u.attn_v.weight", il);
+    l->attn_q_norm = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+    l->attn_k_norm = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+    l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
+    l->ffn_norm    = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+
+    if (il < DS4_N_LEADING_DENSE) {
+        l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+        l->ffn_up   = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+        l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+    } else {
+        l->ffn_gate_inp    = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+        l->ffn_exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+        l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+        l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+        l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+        l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+        l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+        l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+    }
+
+    if (DS4_N_NEXTN_PREDICT != 0 &&
+        il + DS4_N_NEXTN_PREDICT >= DS4_N_LAYER) {
+        l->nextn_eh_proj = required_tensorf(m, "blk.%u.nextn.eh_proj.weight", il);
+        l->nextn_enorm = required_tensorf(m, "blk.%u.nextn.enorm.weight", il);
+        l->nextn_hnorm = required_tensorf(m, "blk.%u.nextn.hnorm.weight", il);
+        l->nextn_shared_head_norm =
+            required_tensorf(m, "blk.%u.nextn.shared_head_norm.weight", il);
+    }
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_bind_glm_dsa_layer(l, m, il);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3) {
+        weights_bind_hy_v3_layer(l, m, il);
         return;
     }
 
@@ -4846,7 +5094,7 @@ static void weights_bind(
     memset(w, 0, sizeof(*w));
 
     uint32_t executable_layers = DS4_N_LAYER;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4 &&
         DS4_N_LAYER > DS4_N_NEXTN_PREDICT) {
         executable_layers = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     }
@@ -4880,7 +5128,7 @@ static void weights_bind(
      * feed glm_graph_eval_mtp_draft. Absent in GLM ggufs without an MTP block,
      * so bind only when the block is actually present. */
     if (!load_slice &&
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4 &&
         executable_layers < DS4_N_LAYER) {
         for (uint32_t il = executable_layers; il < DS4_N_LAYER; il++) {
             char probe[64];
@@ -39357,6 +39605,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                  load_layer_start,
                  load_layer_end,
                  load_output);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3) {
+        if (opt->inspect_only) {
+            *out = e;
+            return 0;
+        }
+        /* Loader and GQA kernels exist; the graph/inference wiring does not
+         * yet. Fail honestly instead of running a wrong family path. */
+        fprintf(stderr,
+                "ds4: Hy3 (hy_v3) tensor layout is recognized, but Hy3 "
+                "inference is not wired yet; use --inspect\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (opt->inspect_only) {
             *out = e;
