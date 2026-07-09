@@ -25600,12 +25600,14 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
             exit(1);
         }
         vocab->system_id = -1;
-        vocab->user_id = -1;
-        vocab->assistant_id = -1;
+        vocab->user_id = vocab_lookup_optional(vocab, "<｜hy_User:opensource｜>");
+        vocab->assistant_id = vocab_lookup_optional(vocab, "<｜hy_Assistant:opensource｜>");
         vocab->observation_id = -1;
-        vocab->sop_id = -1;
-        vocab->think_start_id = vocab_lookup_optional(vocab, "<think>");
-        vocab->think_end_id = vocab_lookup_optional(vocab, "</think>");
+        /* ponytail: reuse the (GLM-only) sop_id slot to hold Hy3's
+         * reasoning-mode marker; no dedicated field needed for one token. */
+        vocab->sop_id = vocab_lookup_optional(vocab, "<｜reasoning_mode:opensource｜>");
+        vocab->think_start_id = vocab_lookup_optional(vocab, "<think:opensource>");
+        vocab->think_end_id = vocab_lookup_optional(vocab, "</think:opensource>");
         vocab->tool_call_start_id = -1;
         vocab->tool_call_end_id = -1;
         vocab->tool_response_start_id = -1;
@@ -25685,7 +25687,8 @@ static void encode_chat_prompt(
         token_vec       *out) {
     const bool need_think_start =
         ds4_think_mode_enabled(think_mode) ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3;
     if (vocab->bos_id < 0 ||
         vocab->user_id < 0 ||
         vocab->assistant_id < 0 ||
@@ -25707,7 +25710,8 @@ static void encode_chat_prompt(
     token_vec_push(out, vocab->assistant_id);
     if (ds4_think_mode_enabled(think_mode)) {
         token_vec_push(out, vocab->think_start_id);
-    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
+               DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3) {
         token_vec_push(out, vocab->think_start_id);
         token_vec_push(out, vocab->think_end_id);
     } else {
@@ -25869,6 +25873,23 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
         return;
     }
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3) {
+        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+            bpe_tokenize_text(vocab, content, tokens);
+        } else if (!strcmp(role, "assistant")) {
+            token_vec_push(tokens, vocab->assistant_id);
+            /* ponytail: no_think framing; v1 does not reconstruct prior
+             * reasoning content into the transcript. */
+            token_vec_push(tokens, vocab->think_start_id);
+            token_vec_push(tokens, vocab->think_end_id);
+            bpe_tokenize_text(vocab, content, tokens);
+        } else {
+            token_vec_push(tokens, vocab->user_id);
+            bpe_tokenize_text(vocab, content, tokens);
+        }
+        return;
+    }
+
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
         bpe_tokenize_text(vocab, content, tokens);
     } else if (!strcmp(role, "assistant")) {
@@ -25890,7 +25911,8 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
     token_vec_push(tokens, e->vocab.assistant_id);
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+    if ((DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
+         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3) &&
         !ds4_think_mode_enabled(think_mode)) {
         token_vec_push(tokens, e->vocab.think_start_id);
         token_vec_push(tokens, e->vocab.think_end_id);
@@ -35062,6 +35084,8 @@ struct ds4_session {
     ds4_glm_gpu_graph glm_graph;
     bool glm_graph_ready;
     uint32_t glm_dense_cache_len;
+    hy3_gpu_state *hy3_state;
+    bool hy3_ready;
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
@@ -35559,6 +35583,10 @@ static bool ds4_session_is_cpu(const ds4_session *s) {
 
 static bool ds4_session_is_glm(const ds4_session *s) {
     return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+}
+
+static bool ds4_session_is_hy3(const ds4_session *s) {
+    return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3;
 }
 
 #ifndef DS4_NO_GPU
@@ -40628,6 +40656,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "ds4: GLM sessions currently require --metal\n");
             return 1;
         }
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3) {
+            fprintf(stderr, "ds4: Hy3 sessions require --cuda\n");
+            return 1;
+        }
         if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
             fprintf(stderr, "ds4: distributed coordinator sessions require the graph backend\n");
             return 1;
@@ -40715,6 +40747,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         *out = s;
         return 0;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_HY_V3) {
+        s->hy3_state = xcalloc(1, sizeof(*s->hy3_state));
+        if (!hy3_state_alloc(s->hy3_state, &e->model, &e->weights,
+                             (uint32_t)ctx_size, e->ssd_streaming)) {
+            free(s->hy3_state);
+            free(s);
+            return 1;
+        }
+        s->hy3_ready = true;
+        s->prefill_cap = (uint32_t)ctx_size;
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        *out = s;
+        return 0;
+    }
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size,
                                                         e->prefill_chunk);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
@@ -40781,7 +40827,12 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
-        if (ds4_session_is_glm(s)) {
+        if (ds4_session_is_hy3(s)) {
+            if (s->hy3_state) {
+                hy3_state_free(s->hy3_state);
+                free(s->hy3_state);
+            }
+        } else if (ds4_session_is_glm(s)) {
             glm_graph_free(&s->glm_graph);
         } else {
             metal_graph_free(&s->graph);
@@ -41606,6 +41657,44 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 #else
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
+
+    if (ds4_session_is_hy3(s)) {
+        if (!s->hy3_ready) {
+            snprintf(err, errlen, "%s Hy3 state is not initialized", backend_name);
+            return 1;
+        }
+        /* Reuse the running KV cache when the new prompt extends the last one;
+         * the per-layer caches are positional so we only forward the suffix. */
+        int start = 0;
+        if (s->checkpoint_valid &&
+            prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+        } else {
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        for (int i = start; i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = (start != 0);
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            const bool last = (i + 1 == prompt->len);
+            if (!hy3_forward_token(s->hy3_state, &e->model, &e->weights,
+                                   prompt->v[i], (uint32_t)i,
+                                   last ? s->logits : NULL)) {
+                snprintf(err, errlen, "Hy3 prefill failed");
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            token_vec_push(&s->checkpoint, prompt->v[i]);
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+        }
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
 
     if (ds4_session_is_glm(s)) {
         if (!s->glm_graph_ready) {
@@ -42501,6 +42590,30 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
+    if (ds4_session_is_hy3(s)) {
+        (void)probe_mtp;
+        if (!s->hy3_ready) {
+            if (errlen) snprintf(err, errlen, "%s Hy3 state is not initialized",
+                                 ds4_backend_name(e->backend));
+            return 1;
+        }
+        if ((uint32_t)s->checkpoint.len >= (uint32_t)s->ctx_size) {
+            if (errlen) snprintf(err, errlen, "Hy3 context reached (%d)", s->ctx_size);
+            return 1;
+        }
+        const uint32_t pos = (uint32_t)s->checkpoint.len;
+        if (!hy3_forward_token(s->hy3_state, &e->model, &e->weights,
+                               token, pos, s->logits)) {
+            if (errlen) snprintf(err, errlen, "%s Hy3 decode failed",
+                                 ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
     if (ds4_session_is_glm(s)) {
         if (!s->glm_graph_ready) {
             if (errlen) snprintf(err, errlen, "%s GLM graph is not initialized",
@@ -42642,6 +42755,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         return 1;
     }
     if (ds4_session_is_glm(s)) {
+        (void)max_tokens;
+        (void)eos_token;
+        if (!accepted || accepted_cap <= 0) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+    if (ds4_session_is_hy3(s)) {
         (void)max_tokens;
         (void)eos_token;
         if (!accepted || accepted_cap <= 0) return 0;
