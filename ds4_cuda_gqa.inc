@@ -9,7 +9,7 @@
  * Everything here is validated by ds4_gpu_gqa_selftest(): a CPU reference
  * implementation runs the identical pipeline on random data and the kernels
  * must match it numerically. Run with `ds4 --gqa-selftest` (no model file
- * needed). Two-pass softmax: correctness first, fusion later.
+ * needed), including a multi-chunk phase for the online-softmax rescale.
  *
  * RoPE convention: HF Llama rotate-half. Pair (i, i + d/2), angle
  * pos * theta^(-2i/d). Hy3 rope_type is "default" (no yarn/ntk scaling). */
@@ -91,7 +91,7 @@ __global__ static void gqa_kv_cache_append_kernel(
         kv_in[((uint64_t)t * n_kv_head + h) * head_dim + d];
 }
 
-/* Causal GQA attention over the cache, two-pass softmax.
+/* Causal GQA attention over the cache, single-pass online softmax.
  * q: [n_tok][n_head][head_dim] (post norm+rope); token t sees cache rows
  * [0, pos0 + t]. out: [n_tok][n_head][head_dim]. One block per (t, h). */
 __global__ static void gqa_attention_kernel(
@@ -114,57 +114,56 @@ __global__ static void gqa_attention_kernel(
     const float *kh = k_cache + (uint64_t)kvh * cap * head_dim;
     const float *vh = v_cache + (uint64_t)kvh * cap * head_dim;
     float scale = rsqrtf((float)head_dim);
-    __shared__ float red[256];
+    /* Online softmax, single pass over K and V.  128 threads: thread d owns
+     * output dim d; rows are processed in chunks of 128 with each thread
+     * computing one row's score, then everyone accumulates V against the
+     * shared per-chunk weights.  Scores are computed exactly once (the old
+     * two-pass version recomputed them per output dim: ~130x the FLOPs and,
+     * past L1, ~head_dim re-reads of K per row at long context). */
+    const uint32_t tid = threadIdx.x;
     __shared__ float sq[128];
-    __shared__ float m_shared, d_shared;
-    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) sq[d] = qh[d];
+    __shared__ float s_w[128];
+    __shared__ float red[128];
+    if (tid < head_dim) sq[tid] = qh[tid];
     __syncthreads();
 
-    /* pass 1: max and denom */
-    float local_max = -INFINITY;
-    for (uint32_t r = threadIdx.x; r < n_rows; r += blockDim.x) {
-        const float *krow = kh + (uint64_t)r * head_dim;
-        float dot = 0.0f;
-        for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * krow[d];
-        local_max = fmaxf(local_max, dot * scale);
-    }
-    red[threadIdx.x] = local_max;
-    __syncthreads();
-    for (uint32_t s = blockDim.x / 2u; s != 0; s >>= 1u) {
-        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) m_shared = red[0];
-    __syncthreads();
-    float m = m_shared;
-    float local_den = 0.0f;
-    for (uint32_t r = threadIdx.x; r < n_rows; r += blockDim.x) {
-        const float *krow = kh + (uint64_t)r * head_dim;
-        float dot = 0.0f;
-        for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * krow[d];
-        local_den += expf(dot * scale - m);
-    }
-    red[threadIdx.x] = local_den;
-    __syncthreads();
-    for (uint32_t s = blockDim.x / 2u; s != 0; s >>= 1u) {
-        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) d_shared = red[0];
-    __syncthreads();
-    float den = d_shared;
-
-    /* pass 2: weighted V sum. Threads own output dims; loop rows. */
-    float *oh = out + ((uint64_t)t * n_head + h) * head_dim;
-    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (uint32_t r = 0; r < n_rows; r++) {
-            const float *krow = kh + (uint64_t)r * head_dim;
+    float acc = 0.0f;   /* V accumulator for dim = tid */
+    float den = 0.0f;   /* running softmax denominator (same in all threads) */
+    float m = -INFINITY;/* running max */
+    for (uint32_t base = 0; base < n_rows; base += 128u) {
+        uint32_t chunk = n_rows - base < 128u ? n_rows - base : 128u;
+        /* one score per thread */
+        float s = -INFINITY;
+        if (tid < chunk) {
+            const float *krow = kh + (uint64_t)(base + tid) * head_dim;
             float dot = 0.0f;
-            for (uint32_t dd = 0; dd < head_dim; dd++) dot += sq[dd] * krow[dd];
-            acc += expf(dot * scale - m) / den * vh[(uint64_t)r * head_dim + d];
+            for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * krow[d];
+            s = dot * scale;
         }
-        oh[d] = acc;
+        red[tid] = s;
+        __syncthreads();
+        for (uint32_t st = 64u; st != 0; st >>= 1u) {
+            if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]);
+            __syncthreads();
+        }
+        float m_new = fmaxf(m, red[0]);
+        float corr = expf(m - m_new); /* expf(-inf) == 0, first chunk safe */
+        acc *= corr;
+        den *= corr;
+        if (tid < chunk) s_w[tid] = expf(s - m_new);
+        __syncthreads();
+        for (uint32_t r = 0; r < chunk; r++) {
+            float w = s_w[r];
+            den += w;
+            if (tid < head_dim) {
+                acc += w * vh[(uint64_t)(base + r) * head_dim + tid];
+            }
+        }
+        m = m_new;
+        __syncthreads();
+    }
+    if (tid < head_dim) {
+        out[((uint64_t)t * n_head + h) * head_dim + tid] = acc / den;
     }
 }
 
@@ -212,7 +211,7 @@ extern "C" int ds4_gpu_gqa_attention(
         return 0;
     }
     dim3 grid(n_tok, n_head, 1);
-    gqa_attention_kernel<<<grid, 256>>>(
+    gqa_attention_kernel<<<grid, 128>>>(
             (float *)out->ptr, (const float *)q->ptr,
             (const float *)k_cache->ptr, (const float *)v_cache->ptr,
             n_tok, n_head, n_kv_head, head_dim, cap, pos0);
@@ -305,9 +304,12 @@ static float gqa_test_randf(void) {
  * head_dim 128. Covers a 13-token prefill at pos0=0 and a 1-token decode at
  * pos0=13 against the populated cache. Returns 1 on pass. */
 extern "C" int ds4_gpu_gqa_selftest(void) {
-    const uint32_t n_head = 64, n_kv_head = 8, hd = 128, cap = 64;
+    const uint32_t n_head = 64, n_kv_head = 8, hd = 128, cap = 256;
     const float eps = 1e-5f, theta = 11158840.0f;
-    const uint32_t phases[2][2] = { {13u, 0u}, {1u, 13u} }; /* {n_tok, pos0} */
+    /* {n_tok, pos0}: short prefill, decode, then a 200-token prefill and a
+     * decode at row 215 to exercise the multi-chunk online-softmax path
+     * (rows > 128 crosses a chunk boundary and rescales acc/den). */
+    const uint32_t phases[4][2] = { {13u, 0u}, {1u, 13u}, {200u, 14u}, {1u, 214u} };
     int all_ok = 1;
 
     float *qn_w = (float *)malloc(hd * sizeof(float));
@@ -330,7 +332,7 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
       ds4_gpu_tensor_write(g_vc, 0, z, kcache_elems * sizeof(float));
       free(z); }
 
-    for (int phase = 0; phase < 2; phase++) {
+    for (int phase = 0; phase < 4; phase++) {
         uint32_t n_tok = phases[phase][0], pos0 = phases[phase][1];
         uint64_t q_elems = (uint64_t)n_tok * n_head * hd;
         uint64_t kv_elems = (uint64_t)n_tok * n_kv_head * hd;

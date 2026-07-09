@@ -219,7 +219,9 @@ ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 DS4_URING_FLAGS := $(shell test -e /usr/include/liburing.h && echo -DDS4_USE_IO_URING)
 DS4_URING_LIBS := $(shell test -e /usr/include/liburing.h && echo -luring)
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc ds4_cuda_gqa.inc \
+	ds4_cuda_glm_kv.inc ds4_cuda_glm_indexer.inc ds4_cuda_glm_attn.inc \
+	ds4_cuda_glm_moe.inc ds4_cuda_glm_stubs.inc
 	$(NVCC) $(NVCCFLAGS) $(DS4_URING_FLAGS) -c -o $@ ds4_cuda.cu
 
 ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
