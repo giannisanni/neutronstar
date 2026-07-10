@@ -1,21 +1,26 @@
-# NeutronStar — GLM-5.2 (743B) on a single consumer GPU
+# NeutronStar: giant MoE models on a single consumer GPU
 
-This is a fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar), collapsed
-further. The `glm-local` branch you are reading adds a **CUDA port for GLM-5.2**, a stack of
-SSD expert-streaming optimizations, and the **first MTP speculative-decoding
-implementation for GLM 5.2 on any backend**.
+A fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) that runs
+frontier Mixture-of-Experts language models on a GPU that has no business
+running them: the routed experts are streamed from SSD on every token while
+attention and shared weights stay resident. Two models work end to end on one
+**RTX 4060 Ti 16GB** today:
 
-The point of all of it: run a 743B-parameter MoE on hardware that has no business
-running it. Reference machine: RTX 4060 Ti 16GB, 30GB DDR5, Ryzen 9900X, one
-Gen4 NVMe. The model file is 196.6 GiB; routed experts are read from disk on
-every token while ~20 GiB of attention/shared weights stay resident.
+- **GLM-5.2** (743B MoE): CUDA port of the whole GLM path, the SSD-streaming
+  optimization stack, and the first MTP speculative-decoding implementation for
+  GLM-5.2 on any backend. ~0.40 tok/s generation, ~6.5 t/s long-prompt prefill.
+  The 196.6 GiB file streams routed experts per token while ~20 GiB of
+  attention/shared weights stay resident.
+- **Tencent Hy3** (295B / 21B-active MoE): a new grouped-query attention path
+  (ds4 was MLA-only), a ds4-native 2-bit quant, and interactive chat with KV
+  retained across turns. ~1.8 tok/s on the same card.
 
-Current state on that machine: **~0.40 tokens/s generation, ~6.5 t/s
-long-prompt prefill** (batch path, prompts over 64 tokens; short prompts run
-token-major at generation speed). The campaign arc was 0.05 → 0.40 t/s
-generation and 0.30 → 6.5 t/s prefill on identical hardware, all software.
-HuggingFace tells you a 4060 Ti cannot run this model. HuggingFace is wrong,
-just slowly.
+Reference machine: RTX 4060 Ti 16GB, 32GB DDR5, Ryzen 9900X, one NVMe. The GLM
+campaign arc was 0.05 → 0.40 t/s generation and 0.30 → 6.5 t/s prefill on
+identical hardware, all software. HuggingFace tells you a 4060 Ti cannot run
+these models. HuggingFace is wrong, just slowly.
+
+This is the `hy3` branch: Hy3 support on top of everything in `glm-local`.
 
 ## The model
 
@@ -31,7 +36,30 @@ streaming cache uses fixed-size slabs and the dp4a kernels decode IQ2_XXS
 directly), everything that makes decisions stays at Q8_0/F32, and blk.78 (the
 MTP draft layer) rides along at Q2_K inside the same file.
 
+For Hy3, grab:
+
+**[huggingface.co/giannisan/Hy3-ds4-gguf](https://huggingface.co/giannisan/Hy3-ds4-gguf)**
+
+Same slab layout: routed experts uniform IQ2_XXS, attention and shared experts
+Q8_0, the nextn/MTP layer (blk.80) at Q2_K. Quantized to the ds4-native layout
+with the `hy-v3` arch string; a from-BF16 rebuild is in progress. Recipe and
+provenance are in the card. Both models live in the
+[NeutronStar collection](https://huggingface.co/collections/giannisan/neutronstar-6a509f2cc7cac276b1f066e0).
+
 ## What this branch adds over upstream
+
+### Tencent Hy3 (295B) support
+ds4 was built entirely around MLA-family attention. Hy3 is Qwen3-shaped: plain
+grouped-query attention (64 query / 8 KV heads, head_dim 128) with per-head
+QK-RMSNorm and NeoX RoPE, a 192-expert top-8 sigmoid router with expert bias, a
+shared expert, and a leading dense layer. This branch adds the GQA path ds4
+never had, in `ds4_cuda_gqa.inc`: per-head weighted QK-RMSNorm, rotate-half
+RoPE, a per-KV-head FP32 KV cache, and a single-pass online-softmax causal GQA
+kernel, all validated against a CPU reference by `ds4 --gqa-selftest` (no model
+file needed). The router, streaming expert cache, shared expert, dense layer,
+and nextn/MTP-layer handling are reused from the GLM plumbing. Result: Hy3 runs
+end to end with interactive chat, ~1.8 tok/s. The engine recognizes the model
+from the `hy-v3` GGUF arch string.
 
 ### GLM-5.2 CUDA port
 Upstream runs GLM-5.2 on Metal. This branch makes the whole GLM path work on
@@ -123,18 +151,23 @@ Plus `DS4_CUDA_ARENA_VRAM_RESERVE_GB` to keep VRAM headroom for batch kernels.
 ## Quick start
 
 ```sh
-git clone -b glm-local https://github.com/giannisanni/neutronstar
-cd ds4 && make cuda CUDA_ARCH=sm_89
+git clone -b hy3 https://github.com/giannisanni/neutronstar
+cd neutronstar && make cuda CUDA_ARCH=sm_89
 
+# GLM-5.2 (743B)
 M=GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf
-
-# one-shot
 DS4_GLM_CUDA_UNSAFE=1 DS4_CUDA_HOST_EXPERT_CACHE_GB=7 DS4_CUDA_PARALLEL_FETCH_THREADS=16 \
 ./ds4 -m $M --cuda --ssd-streaming --ssd-streaming-cache-experts 64 \
   --ctx 4096 --tokens 400 --nothink -p "Tell me something surprising about Suriname."
 
-# interactive chat (Ollama-style): drop -p
-# MTP probe telemetry: add --mtp $M with DS4_MTP_PROBE=1 DS4_MTP_STREAMING_UNSAFE=1
+# Tencent Hy3 (295B)
+H=Hy3-ds4-IQ2XXS-AttnQ8.gguf
+DS4_CUDA_HOST_EXPERT_CACHE_GB=16 DS4_CUDA_PARALLEL_FETCH_THREADS=16 \
+./ds4 -m $H --cuda --ssd-streaming --ssd-streaming-cache-experts 64 \
+  --ctx 4096 --tokens 400 --nothink -p "Tell me something surprising about Suriname."
+
+# interactive chat (Ollama-style): drop -p on either model
+# GLM MTP probe telemetry: add --mtp $M with DS4_MTP_PROBE=1 DS4_MTP_STREAMING_UNSAFE=1
 ```
 
 Memory sizing on a 30GB host: the resident weights want ~9-13 GiB VRAM plus
@@ -159,11 +192,15 @@ of headroom (7 GiB cache is the knife-edge, 5 is comfortable).
 
 ## Roadmap on this branch
 
+The bottleneck is memory bandwidth and disk, not GPU compute. Next levers:
 Gen5 NVMe (drive-limited today: the engine runs at ~89% of the link ceiling),
-second 16GB GPU (two-worker split removes the pinned-arena tax), per-expert
-batch loads (unlocks the MTP accept loop), and GPU-initiated NVMe reads
-(BaM-style; simulator already passing, design in `docs/gpu-nvme-design.md`).
-MTP notes in `docs/glm-mtp-port.md`.
+more host RAM (bigger LFU expert cache: 16 GiB gets Hy3 to a 68% hit rate),
+and **multi-GPU expert residency** (hold a large fraction of experts in VRAM
+across several cards, ~30x faster than disk streaming; the reason to add a
+second and third 16GB GPU). Further out: GPU-initiated NVMe reads (BaM-style;
+simulator already passing, design in `docs/gpu-nvme-design.md`), and a from-BF16
+canonical Hy3 quant. MTP notes in `docs/glm-mtp-port.md`; on streaming MoE the
+accept loop is net-negative until the disk stops being the bottleneck.
 
 ## Relation to upstream
 
