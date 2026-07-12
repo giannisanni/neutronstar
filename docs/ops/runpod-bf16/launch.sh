@@ -26,7 +26,11 @@ echo "job: $RAW_URL"
 # resume; worst case rerun ~$4) carries the 1.1TB working set instead.
 # REST API: the deprecated CLI path demands gpuTypeId even for CPU pods, and
 # the new CLI has no vCPU sizing flags.
-echo "== 2. create CPU pod (cpu3c, 16 vCPU / 32GB, 1.1TB local volume) =="
+# GPU pod, not CPU: the REST API silently drops volumeInGb on CPU pods
+# (both early attempts ran on a bare 30GB container disk and died in the
+# 598GB download), and CPU container disk is capped at ~10GB/vCPU. GPU pods
+# honor big local volumes; cheapest cards first, ~$0.2-0.5/hr.
+echo "== 2. create GPU pod (cheap card, 1.1TB local volume) =="
 CARD_B64=$(base64 < "$HERE/hf-model-card.md" | tr -d '\n')
 BODY=$(python3 - "$HF_TOKEN" "$KEY" "$RAW_URL" "$CARD_B64" << 'PYEOF'
 import json, sys
@@ -34,11 +38,11 @@ hf, key, url, card = sys.argv[1:5]
 print(json.dumps({
   "name": "hy3-bf16-quant",
   "imageName": "python:3.11-bookworm",
-  "computeType": "CPU",
   "cloudType": "SECURE",
-  "cpuFlavorIds": ["cpu3c"],
-  "vcpuCount": 16,
-  "containerDiskInGb": 30,
+  "gpuTypeIds": ["NVIDIA RTX 2000 Ada Generation", "NVIDIA RTX A4000",
+                  "NVIDIA RTX A4500", "NVIDIA GeForce RTX 3090"],
+  "gpuCount": 1,
+  "containerDiskInGb": 20,
   "volumeInGb": 1100,
   "volumeMountPath": "/vol",
   "dockerStartCmd": ["bash", "-c", "curl -sL $JOB_URL -o /job.sh && bash /job.sh"],
