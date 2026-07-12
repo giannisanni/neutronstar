@@ -37,7 +37,7 @@ curl -sL --max-time 120 -r 0-1073741823 -o /dev/null \
   "https://huggingface.co/tencent/Hy3/resolve/main/model-00001-of-00099.safetensors" || die "speed test fetch"
 T1=$(date +%s); MBPS=$(( 1024 / (T1 - T0 + 1) ))
 echo "network: ~${MBPS} MB/s" | tee -a "$LOG"
-[ "$MBPS" -lt 80 ] && die "network too slow (${MBPS} MB/s), aborting to save credit"
+[ "$MBPS" -lt 45 ] && die "network too slow (${MBPS} MB/s), aborting to save credit"
 
 mark "PHASE 2: llama.cpp (PR 25395, arch string patched to hy-v3)"
 cd /root
