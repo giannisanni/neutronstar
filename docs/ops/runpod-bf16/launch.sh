@@ -24,20 +24,32 @@ echo "job: $RAW_URL"
 # No network volume: RunPod requires a $5 minimum balance to create one, and
 # the job is self-contained anyway. A pod-local volume (dies with the pod, no
 # resume; worst case rerun ~$4) carries the 1.1TB working set instead.
+# REST API: the deprecated CLI path demands gpuTypeId even for CPU pods, and
+# the new CLI has no vCPU sizing flags.
 echo "== 2. create CPU pod (cpu3c, 16 vCPU / 32GB, 1.1TB local volume) =="
-runpodctl create pod \
-  --computeType CPU --secureCloud \
-  --name hy3-bf16-quant \
-  --imageName python:3.11-bookworm \
-  --vcpu 16 --mem 32 \
-  --containerDiskSize 30 \
-  --volumeSize 1100 --volumePath /vol \
-  --cost 0.80 \
-  --env "HF_TOKEN=$HF_TOKEN" \
-  --env "RUNPOD_API_KEY=$KEY" \
-  --env "JOB_URL=$RAW_URL" \
-  --env "CARD_B64=$(base64 < "$HERE/hf-model-card.md" | tr -d '\n')" \
-  --args 'bash -c "curl -sL $JOB_URL -o /job.sh && bash /job.sh"'
+CARD_B64=$(base64 < "$HERE/hf-model-card.md" | tr -d '\n')
+BODY=$(python3 - "$HF_TOKEN" "$KEY" "$RAW_URL" "$CARD_B64" << 'PYEOF'
+import json, sys
+hf, key, url, card = sys.argv[1:5]
+print(json.dumps({
+  "name": "hy3-bf16-quant",
+  "imageName": "python:3.11-bookworm",
+  "computeType": "CPU",
+  "cloudType": "SECURE",
+  "cpuFlavorIds": ["cpu3c"],
+  "vcpuCount": 16,
+  "containerDiskInGb": 30,
+  "volumeInGb": 1100,
+  "volumeMountPath": "/vol",
+  "dockerStartCmd": ["bash", "-c", "curl -sL $JOB_URL -o /job.sh && bash /job.sh"],
+  "env": {"HF_TOKEN": hf, "RUNPOD_API_KEY": key, "JOB_URL": url, "CARD_B64": card},
+}))
+PYEOF
+)
+R=$(rest POST pods "$BODY")
+PODID=$(echo "$R" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('id') or '')" 2>/dev/null)
+[ -z "$PODID" ] && { echo "pod create failed: $(echo "$R" | head -c 300)"; exit 1; }
+echo "pod: $PODID"
 
 cat <<EOF
 
