@@ -57,6 +57,9 @@ with the `hy-v3` arch string; a from-BF16 rebuild is in progress. Recipe and
 provenance are in the card. Both models live in the
 [NeutronStar collection](https://huggingface.co/collections/giannisan/neutronstar-6a509f2cc7cac276b1f066e0).
 
+Benchmarking your own hardware: see [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+for the exact commands behind every number here.
+
 ## What this fork adds over upstream
 
 ### Tencent Hy3 (295B) support
