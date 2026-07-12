@@ -34534,6 +34534,245 @@ static void hy3_prefetch_next_layer_experts(
     }
 }
 
+/* Batch prefill: chunk-sized working buffers, allocated only when a prompt
+ * is long enough to take the batch path and freed as soon as prefill ends
+ * (the VRAM goes back to the expert cache for decode). */
+#define HY3_PREFILL_CHUNK_MAX 256u
+
+/* Chunk size for Hy3 batch prefill. The per-layer union expert load
+ * saturates near the full expert set well below 64 tokens, so a larger
+ * chunk reads the same bytes and amortizes them over more tokens; the
+ * ceiling is VRAM for the batch buffers. DS4_HY3_PREFILL_CHUNK overrides. */
+static uint32_t hy3_prefill_chunk(void) {
+    static uint32_t chunk = 0;
+    if (chunk == 0) {
+        chunk = 256u;
+        const char *env = getenv("DS4_HY3_PREFILL_CHUNK");
+        if (env && env[0]) {
+            int v = atoi(env);
+            if (v >= 8 && v <= (int)HY3_PREFILL_CHUNK_MAX) chunk = (uint32_t)v;
+        }
+    }
+    return chunk;
+}
+
+typedef struct hy3_batch_bufs {
+    uint32_t cap;
+    ds4_gpu_tensor *tok, *cur, *attn_norm, *q, *k, *v, *heads, *attn_out,
+        *after_attn, *ffn_norm, *dense_gate, *dense_up, *dense_mid,
+        *shexp_gate, *shexp_up, *shexp_mid, *shared_out,
+        *router_logits, *router_probs, *router_selected, *router_weights,
+        *routed_gate, *routed_up, *routed_mid, *routed_down, *routed_out;
+} hy3_batch_bufs;
+
+static void hy3_batch_bufs_free(hy3_batch_bufs *b) {
+    if (!b) return;
+    ds4_gpu_tensor **t = (ds4_gpu_tensor **)&b->tok;
+    const size_t n = (sizeof(*b) - offsetof(hy3_batch_bufs, tok)) / sizeof(*t);
+    for (size_t i = 0; i < n; i++) ds4_gpu_tensor_free(t[i]);
+    memset(b, 0, sizeof(*b));
+}
+
+static bool hy3_batch_bufs_alloc(hy3_batch_bufs *b, uint32_t cap) {
+    memset(b, 0, sizeof(*b));
+    b->cap = cap;
+    const uint64_t C = cap;
+    const uint64_t embd = DS4_N_EMBD, hd = DS4_N_HEAD_DIM;
+    b->tok = ds4_gpu_tensor_alloc(C * sizeof(int32_t));
+    b->cur = ds4_gpu_tensor_alloc(C * embd * sizeof(float));
+    b->attn_norm = ds4_gpu_tensor_alloc(C * embd * sizeof(float));
+    b->q = ds4_gpu_tensor_alloc(C * DS4_N_HEAD * hd * sizeof(float));
+    b->k = ds4_gpu_tensor_alloc(C * DS4_N_HEAD_KV * hd * sizeof(float));
+    b->v = ds4_gpu_tensor_alloc(C * DS4_N_HEAD_KV * hd * sizeof(float));
+    b->heads = ds4_gpu_tensor_alloc(C * DS4_N_HEAD * hd * sizeof(float));
+    b->attn_out = ds4_gpu_tensor_alloc(C * embd * sizeof(float));
+    b->after_attn = ds4_gpu_tensor_alloc(C * embd * sizeof(float));
+    b->ffn_norm = ds4_gpu_tensor_alloc(C * embd * sizeof(float));
+    b->dense_gate = ds4_gpu_tensor_alloc(C * DS4_N_FF_DENSE * sizeof(float));
+    b->dense_up = ds4_gpu_tensor_alloc(C * DS4_N_FF_DENSE * sizeof(float));
+    b->dense_mid = ds4_gpu_tensor_alloc(C * DS4_N_FF_DENSE * sizeof(float));
+    b->shexp_gate = ds4_gpu_tensor_alloc(C * DS4_N_FF_EXP * sizeof(float));
+    b->shexp_up = ds4_gpu_tensor_alloc(C * DS4_N_FF_EXP * sizeof(float));
+    b->shexp_mid = ds4_gpu_tensor_alloc(C * DS4_N_FF_EXP * sizeof(float));
+    b->shared_out = ds4_gpu_tensor_alloc(C * embd * sizeof(float));
+    b->router_logits = ds4_gpu_tensor_alloc(C * DS4_N_EXPERT * sizeof(float));
+    b->router_probs = ds4_gpu_tensor_alloc(C * DS4_N_EXPERT * sizeof(float));
+    b->router_selected = ds4_gpu_tensor_alloc(C * DS4_N_EXPERT_USED * sizeof(int32_t));
+    b->router_weights = ds4_gpu_tensor_alloc(C * DS4_N_EXPERT_USED * sizeof(float));
+    b->routed_gate = ds4_gpu_tensor_alloc(C * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+    b->routed_up = ds4_gpu_tensor_alloc(C * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+    b->routed_mid = ds4_gpu_tensor_alloc(C * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+    b->routed_down = ds4_gpu_tensor_alloc(C * DS4_N_EXPERT_USED * embd * sizeof(float));
+    b->routed_out = ds4_gpu_tensor_alloc(C * embd * sizeof(float));
+    ds4_gpu_tensor **t = (ds4_gpu_tensor **)&b->tok;
+    const size_t n = (sizeof(*b) - offsetof(hy3_batch_bufs, tok)) / sizeof(*t);
+    for (size_t i = 0; i < n; i++) {
+        if (!t[i]) {
+            hy3_batch_bufs_free(b);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Batch forward for prefill: n tokens at positions pos0..pos0+n-1, no
+ * logits (the caller runs the final prompt token through the token path,
+ * which also produces the first-token logits).  Same math as
+ * hy3_forward_token with the token dimension threaded through; the routed
+ * MoE goes through the batch expert kernels and the selected load dedups
+ * the whole chunk's experts into one union disk pass. */
+static bool hy3_forward_batch(
+        hy3_gpu_state     *s,
+        hy3_batch_bufs    *b,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const int         *toks,
+        uint32_t           n,
+        uint32_t           pos0) {
+    if (n == 0 || n > b->cap || pos0 + n > s->ctx) return false;
+    int32_t t32[HY3_PREFILL_CHUNK_MAX];
+    for (uint32_t i = 0; i < n; i++) t32[i] = (int32_t)toks[i];
+    if (ds4_gpu_tensor_write(b->tok, 0, t32, (uint64_t)n * sizeof(t32[0])) == 0) {
+        return false;
+    }
+    bool ok = ds4_gpu_embed_tokens_q8_0_tensor(b->cur, b->tok,
+            model->map, model->size, weights->token_embd->abs_offset,
+            DS4_N_VOCAB, n, DS4_N_EMBD) != 0;
+    for (uint32_t il = 0; ok && il < s->n_exec_layer; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        /* attention */
+        ok = ds4_gpu_rms_norm_weight_rows_tensor(b->attn_norm, b->cur,
+                model->map, model->size, l->attn_norm->abs_offset,
+                DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(b->q, model->map, model->size,
+                l->attn_q->abs_offset, DS4_N_EMBD,
+                (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM, b->attn_norm, n) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(b->k, model->map, model->size,
+                l->attn_k->abs_offset, DS4_N_EMBD,
+                (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM, b->attn_norm, n) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(b->v, model->map, model->size,
+                l->attn_v->abs_offset, DS4_N_EMBD,
+                (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM, b->attn_norm, n) != 0;
+        if (ok) ok = ds4_gpu_gqa_head_rms_norm_weight(b->q, s->qn[il],
+                n * DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_gqa_head_rms_norm_weight(b->k, s->kn[il],
+                n * DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
+        if (ok) ok = ds4_gpu_gqa_rope(b->q, n, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                pos0, DS4_ROPE_FREQ_BASE) != 0;
+        if (ok) ok = ds4_gpu_gqa_rope(b->k, n, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                pos0, DS4_ROPE_FREQ_BASE) != 0;
+        if (ok) ok = ds4_gpu_gqa_kv_cache_append(s->kcache[il], b->k, n,
+                DS4_N_HEAD_KV, DS4_N_HEAD_DIM, s->ctx, pos0) != 0;
+        if (ok) ok = ds4_gpu_gqa_kv_cache_append(s->vcache[il], b->v, n,
+                DS4_N_HEAD_KV, DS4_N_HEAD_DIM, s->ctx, pos0) != 0;
+        if (ok) ok = ds4_gpu_gqa_attention(b->heads, b->q,
+                s->kcache[il], s->vcache[il], n,
+                DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, s->ctx, pos0) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(b->attn_out, model->map,
+                model->size, l->attn_output->abs_offset,
+                (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM, DS4_N_EMBD,
+                b->heads, n) != 0;
+        if (ok) ok = ds4_gpu_add_tensor(b->after_attn, b->cur, b->attn_out,
+                n * DS4_N_EMBD) != 0;
+        /* ffn */
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(b->ffn_norm,
+                b->after_attn, model->map, model->size,
+                l->ffn_norm->abs_offset, DS4_N_EMBD, n, DS4_RMS_EPS) != 0;
+        if (!ok) break;
+        if (il < DS4_N_LEADING_DENSE) {
+            ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+                    b->dense_gate, b->dense_up, b->dense_mid,
+                    model->map, model->size,
+                    l->ffn_gate->abs_offset, l->ffn_up->abs_offset,
+                    DS4_N_EMBD, DS4_N_FF_DENSE, b->ffn_norm, n, 0.0f) != 0;
+            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(b->routed_out,
+                    model->map, model->size, l->ffn_down->abs_offset,
+                    DS4_N_FF_DENSE, DS4_N_EMBD, b->dense_mid, n) != 0;
+            if (ok) ok = ds4_gpu_add_tensor(b->cur, b->after_attn,
+                    b->routed_out, n * DS4_N_EMBD) != 0;
+            continue;
+        }
+        /* router over all rows */
+        ok = ds4_gpu_matmul_f32_tensor(b->router_logits, model->map,
+                model->size, l->ffn_gate_inp->abs_offset,
+                DS4_N_EMBD, DS4_N_EXPERT, b->ffn_norm, n) != 0;
+        if (ok) ok = ds4_gpu_glm_router_select_batch_tensor(b->router_selected,
+                b->router_weights, b->router_probs, model->map, model->size,
+                l->ffn_exp_probs_b->abs_offset, b->router_logits,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE,
+                n) != 0;
+        uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
+        uint64_t up_in = 0, up_out = 0, up_row_bytes = 0;
+        uint64_t down_in = 0, down_out = 0, down_row_bytes = 0;
+        (void)tensor_expert_bytes(model, l->ffn_gate_exps, 0, &gate_in, &gate_out, &gate_row_bytes);
+        (void)tensor_expert_bytes(model, l->ffn_up_exps, 0, &up_in, &up_out, &up_row_bytes);
+        (void)tensor_expert_bytes(model, l->ffn_down_exps, 0, &down_in, &down_out, &down_row_bytes);
+        if (ok && s->ssd_streaming) {
+#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
+            /* Batch selected load wants host ids + n_tokens: the single-token
+             * entry registers the wrong slot count and the MoE launcher then
+             * silently falls back to whole-tensor model views (host OOM). */
+            int32_t sel_ids[HY3_PREFILL_CHUNK_MAX * 16];
+            if ((uint64_t)n * DS4_N_EXPERT_USED >
+                    sizeof(sel_ids) / sizeof(sel_ids[0])) {
+                return false;
+            }
+            ok = ds4_gpu_end_commands() != 0 &&
+                 ds4_gpu_tensor_read(b->router_selected, 0, sel_ids,
+                         (uint64_t)n * DS4_N_EXPERT_USED * sizeof(sel_ids[0])) != 0;
+            if (ok) {
+                const ds4_gpu_stream_expert_table table = {
+                    .model_map = model->map,
+                    .model_size = model->size,
+                    .layer = il,
+                    .n_total_expert = DS4_N_EXPERT,
+                    .gate_offset = l->ffn_gate_exps->abs_offset,
+                    .up_offset = l->ffn_up_exps->abs_offset,
+                    .down_offset = l->ffn_down_exps->abs_offset,
+                    .gate_expert_bytes = gate_out * gate_row_bytes,
+                    .down_expert_bytes = down_out * down_row_bytes,
+                };
+                ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                        &table, sel_ids, n, DS4_N_EXPERT_USED) != 0;
+            }
+            if (ok) ok = ds4_gpu_begin_commands() != 0;
+#else
+            ok = false; /* streaming batch prefill is CUDA/ROCm-only */
+#endif
+        }
+        /* shared expert */
+        if (ok) ok = ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+                b->shexp_gate, b->shexp_up, b->shexp_mid,
+                model->map, model->size,
+                l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                DS4_N_EMBD, DS4_N_FF_EXP, b->ffn_norm, n, 0.0f) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(b->shared_out, model->map,
+                model->size, l->ffn_down_shexp->abs_offset,
+                DS4_N_FF_EXP, DS4_N_EMBD, b->shexp_mid, n) != 0;
+        /* routed experts, whole chunk per launch */
+        if (ok) {
+            bool mid_is_f16 = false;
+            ok = ds4_gpu_routed_moe_batch_tensor(b->routed_out,
+                    b->routed_gate, b->routed_up, b->routed_mid, b->routed_down,
+                    model->map, model->size,
+                    l->ffn_gate_exps->abs_offset,
+                    l->ffn_up_exps->abs_offset,
+                    l->ffn_down_exps->abs_offset,
+                    l->ffn_gate_exps->type,
+                    l->ffn_down_exps->type,
+                    gate_out * gate_row_bytes, gate_row_bytes,
+                    down_out * down_row_bytes, down_row_bytes,
+                    DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                    b->router_selected, b->router_weights,
+                    DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                    0.0f, b->ffn_norm, il, n, &mid_is_f16) != 0;
+        }
+        if (ok) ok = ds4_gpu_add3_tensor(b->cur, b->after_attn,
+                b->routed_out, b->shared_out, n * DS4_N_EMBD) != 0;
+    }
+    return ok;
+}
+
 /* One full forward for one token at absolute position pos.  Reads the
  * embedding, runs every executable layer, and (optionally) produces host
  * logits.  The residual stream lives in s->cur throughout. */
@@ -34711,10 +34950,63 @@ static int generate_hy3_cuda_argmax(
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     bool ok = true;
     const double t_prefill0 = now_sec();
-    for (int i = 0; ok && i < prompt->len; i++) {
+    /* Long prompts: batch prefill in chunks (union expert loads amortize the
+     * disk pass across the whole chunk), leaving the final prompt token for
+     * the token path below, which produces the first logits. Falls back to
+     * token-major when the batch buffers cannot be allocated. */
+    int start = 0;
+    if (prompt->len > 24 && getenv("DS4_HY3_DISABLE_BATCH_PREFILL") == NULL) {
+        hy3_batch_bufs bb;
+        uint32_t chunk_cap = hy3_prefill_chunk();
+        bool bufs_ok = false;
+        /* halve on VRAM-tight cards until the buffers fit */
+        for (; chunk_cap >= 32u; chunk_cap /= 2u) {
+            if (hy3_batch_bufs_alloc(&bb, chunk_cap)) { bufs_ok = true; break; }
+        }
+        if (bufs_ok) {
+            const int last = prompt->len - 1;
+            while (ok && start < last) {
+                uint32_t chunk = (uint32_t)(last - start) < chunk_cap ?
+                        (uint32_t)(last - start) : chunk_cap;
+                ok = hy3_forward_batch(&s, &bb, model, weights,
+                                       prompt->v + start, chunk,
+                                       (uint32_t)start);
+                if (ok) start += (int)chunk;
+                if (progress) progress(progress_ud, "prefill_chunk", start, prompt->len);
+            }
+            hy3_batch_bufs_free(&bb);
+            if (!ok) {
+                fprintf(stderr, "ds4: Hy3 batch prefill failed\n");
+            }
+        } else {
+            fprintf(stderr,
+                    "ds4: Hy3 batch prefill buffers unavailable; using token-major prefill\n");
+        }
+    }
+    for (int i = start; ok && i < prompt->len; i++) {
         const bool last = i + 1 == prompt->len;
         ok = hy3_forward_token(&s, model, weights, prompt->v[i],
                                (uint32_t)i, last ? logits : NULL);
+        if (ok && last && getenv("DS4_HY3_PREFILL_LOGIT_DUMP")) {
+            /* top-5 logits of the first generated token: compare across
+             * batch and token-major prefill to tell near-tie argmax flips
+             * (small deltas) from real prefill bugs (large deltas). */
+            int top[5] = {-1, -1, -1, -1, -1};
+            for (int v = 0; v < (int)DS4_N_VOCAB; v++) {
+                for (int r = 0; r < 5; r++) {
+                    if (top[r] < 0 || logits[v] > logits[top[r]]) {
+                        for (int q = 4; q > r; q--) top[q] = top[q - 1];
+                        top[r] = v;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "ds4: prefill top5:");
+            for (int r = 0; r < 5; r++) {
+                fprintf(stderr, " %d=%.6f", top[r], (double)logits[top[r]]);
+            }
+            fprintf(stderr, "\n");
+        }
         if (progress) progress(progress_ud, "prefill_chunk", i + 1, prompt->len);
     }
     const double t_prefill1 = now_sec();

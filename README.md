@@ -18,7 +18,8 @@ one **RTX 4060 Ti 16GB** today:
   (ds4 was MLA-only), a ds4-native 2-bit quant, interactive chat with KV
   retained across turns, and speculative cross-layer expert prefetch (the
   next layer's router runs early so the SSD reads its experts while the GPU
-  is still on the current layer). ~2.1 tok/s on the same card.
+  is still on the current layer). ~2.1 tok/s generation, ~6.1 t/s
+  long-prompt batch prefill on the same card.
 - **DeepSeek 4 / 4 Flash**: upstream ds4's original target, inherited intact
   (MLA attention, DSA sparse indexer); the GLM CUDA work runs on the same
   MLA plumbing.
@@ -150,7 +151,17 @@ Nobody had run interactive GLM sessions on CUDA streaming before, and it showed:
   the CUDA batch path. Fixed by hoisting the LUT loads; submitted upstream
   as antirez/ds4#513.
 
-### Long-prompt prefill: 0.30 -> 6.5 t/s (21x)
+### Long-prompt prefill: 0.30 -> 6.5 t/s on GLM (21x), 0.62 -> 6.1 t/s on Hy3 (10x)
+Hy3 batch prefill processes the prompt in chunks (default 256 tokens,
+`DS4_HY3_PREFILL_CHUNK`); each layer's chunk-wide expert union loads in one
+disk pass, so the same bytes serve up to 256 tokens instead of one. Chunk
+scaling on a ~1900-token prompt: 64 -> 2.77, 128 -> 4.17, 256 -> 6.06 t/s
+(the per-layer union saturates near the full expert set, so bigger chunks
+are nearly free tokens). Output is correct but not bit-identical to
+token-major prefill: the batch kernels quantize activations on a different
+path, so near-tie argmax picks can flip (same contract as GLM batch
+prefill).
+
 With the LUT fix, GLM batch prefill works and is transformative: a 600-token
 prompt prefills at **6.5 t/s** vs 0.30 t/s token-major, because a chunk's
 tokens per layer collectively route to most of the 256 experts, so one
