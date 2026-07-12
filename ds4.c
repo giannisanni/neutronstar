@@ -34464,18 +34464,11 @@ static bool hy3_state_alloc(
  * mechanism as glm_graph_prefetch_next_layer_experts; mispredictions only
  * cost idle disk bandwidth.  Opt in with DS4_GLM_EXPERT_PREFETCH=1 (needs
  * the io_uring fetch engine). */
-static void hy3_prefetch_next_layer_experts(
+static void hy3_prefetch_one_layer_experts(
         hy3_gpu_state     *s,
         const ds4_model   *model,
         const ds4_weights *weights,
-        uint32_t           il) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *env = getenv("DS4_GLM_EXPERT_PREFETCH");
-        enabled = env && env[0] == '1';
-    }
-    if (!enabled || !s->ssd_streaming) return;
-    const uint32_t nl = il + 1;
+        uint32_t           nl) {
     if (nl >= s->n_exec_layer || nl < DS4_N_LEADING_DENSE) return;
     const ds4_layer_weights *ln = &weights->layer[nl];
     if (!ln->ffn_gate_inp || !ln->ffn_exp_probs_b ||
@@ -34516,6 +34509,29 @@ static void hy3_prefetch_next_layer_experts(
     (void)ds4_gpu_stream_expert_cache_prefetch(&table,
                                                s->prefetch_selected,
                                                DS4_N_EXPERT_USED);
+}
+
+static void hy3_prefetch_next_layer_experts(
+        hy3_gpu_state     *s,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il) {
+    static int depth = -1;
+    if (depth < 0) {
+        const char *env = getenv("DS4_GLM_EXPERT_PREFETCH");
+        depth = (env && env[0] == '1') ? 1 : 0;
+        env = getenv("DS4_EXPERT_PREFETCH_DEPTH");
+        if (depth && env && env[0]) {
+            int v = atoi(env);
+            if (v >= 1 && v <= 4) depth = v;
+        }
+    }
+    if (!depth || !s->ssd_streaming) return;
+    /* Deeper lookahead reuses il's hidden state for il+2.. routers:
+     * accuracy decays with distance, mispredicts only waste idle disk. */
+    for (int d = 1; d <= depth; d++) {
+        hy3_prefetch_one_layer_experts(s, model, weights, il + (uint32_t)d);
+    }
 }
 
 /* One full forward for one token at absolute position pos.  Reads the
