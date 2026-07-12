@@ -2692,8 +2692,18 @@ static void *cuda_host_cache_warm_thread(void *arg) {
     const int use_direct = g_model_direct_fd >= 0;
     uint64_t warmed = 0, skipped = 0, next_report = 4ull << 30;
     const double t0 = (double)time(NULL);
+    uint64_t last_misses = g_host_cache_misses;
     for (uint32_t i = 0; i < n; i++) {
         const cuda_warm_entry *e = &ents[i];
+        /* Yield to demand traffic: while decode misses are flowing, the
+         * warm sweep must not saturate the drive (it turned short runs
+         * from ~2.0 to ~0.5 t/s). Miss-counter delta is the cheap proxy:
+         * trickle at ~30 reads/s when demand is active, full speed when
+         * the disk is otherwise idle (model load, between turns). */
+        if (g_host_cache_misses != last_misses) {
+            last_misses = g_host_cache_misses;
+            usleep(30000);
+        }
         if (cuda_host_cache_contains(e->offset, e->bytes)) {
             skipped++;
             continue;
