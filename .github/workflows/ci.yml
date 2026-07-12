@@ -1,0 +1,29 @@
+name: ci
+on:
+  push:
+    branches: [main, hy3]
+  pull_request:
+
+jobs:
+  # Pure-C CPU backend: fast sanity for every PR, no CUDA toolchain needed.
+  cpu-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build CPU backend
+        run: make cpu -j"$(nproc)"
+
+  # Full CUDA backend compile + link on a GPU-less runner, then the test
+  # binaries (they link cudart but the suites exercise host code).
+  cuda-build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install CUDA toolchain + liburing
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nvidia-cuda-toolkit liburing-dev g++-12
+      - name: build ds4 (CUDA, compile+link only)
+        run: make ds4 -j"$(nproc)" NVCC="nvcc -ccbin g++-12" CUDA_HOME=/usr CUDA_ARCH=sm_89
+      - name: tests
+        run: make test NVCC="nvcc -ccbin g++-12" CUDA_HOME=/usr CUDA_ARCH=sm_89
