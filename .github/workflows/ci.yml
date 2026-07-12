@@ -23,7 +23,9 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q nvidia-cuda-toolkit liburing-dev g++-12
-      - name: build ds4 (CUDA, compile+link only)
-        run: make ds4 -j"$(nproc)" NVCC="nvcc -ccbin g++-12" CUDA_HOME=/usr CUDA_ARCH=sm_89
-      - name: tests
-        run: make test NVCC="nvcc -ccbin g++-12" CUDA_HOME=/usr CUDA_ARCH=sm_89
+      - name: build ds4 + test binaries (CUDA, compile+link only)
+        run: make ds4 ds4-eval ds4_agent_test q4k-dot-test -j"$(nproc)" NVCC="nvcc -ccbin g++-12" CUDA_HOME=/usr CUDA_ARCH=sm_89
+      - name: model-free tests (ds4_test needs a gguf; runs on real hardware instead)
+        run: |
+          ./ds4-eval --self-test-extractors
+          ./ds4_agent_test

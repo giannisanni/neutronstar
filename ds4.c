@@ -12820,6 +12820,15 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
         name, minv, maxv, sqrt(ss / (double)n));
 }
 
+/* Pure host arithmetic used by session code on every backend, including
+ * DS4_NO_GPU builds; keep it outside the GPU-only region. */
+static uint32_t glm_graph_normal_layer_count(void) {
+    if (DS4_N_LAYER <= DS4_N_NEXTN_PREDICT || DS4_N_LAYER > DS4_MAX_LAYER) {
+        return 0;
+    }
+    return DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+}
+
 #ifndef DS4_NO_GPU
 /*
  * Apple Metal stores the persistent attention-compressed KV cache in F16.  The
@@ -24163,13 +24172,6 @@ static bool glm_graph_expanded_kv_cache_enabled(bool ssd_streaming) {
 static bool glm_graph_layer_uses_full_indexer(uint32_t il) {
     if (il < DS4_N_LEADING_DENSE) return true;
     return il >= 6u && ((il - 6u) % 4u) == 0u;
-}
-
-static uint32_t glm_graph_normal_layer_count(void) {
-    if (DS4_N_LAYER <= DS4_N_NEXTN_PREDICT || DS4_N_LAYER > DS4_MAX_LAYER) {
-        return 0;
-    }
-    return DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
 }
 
 static uint32_t glm_graph_full_indexer_layer_count_range(uint32_t layer_start,
