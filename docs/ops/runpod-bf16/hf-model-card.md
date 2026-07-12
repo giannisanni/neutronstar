@@ -12,8 +12,8 @@ tags:
 # Hy3 (295B) GGUF for ds4/NeutronStar (SSD streaming, CUDA)
 
 Mixed-precision GGUFs of [tencent/Hy3](https://huggingface.co/tencent/Hy3)
-(295B total / 21B active MoE, Apache 2.0) built for the
-[NeutronStar](https://github.com/giannisanni/neutronstar) `hy3` branch: a
+(295B total / 21B active MoE, Apache 2.0) built for
+[NeutronStar](https://github.com/giannisanni/neutronstar): a
 CUDA port of [ds4](https://github.com/antirez/ds4) that streams routed
 experts from disk, so the model runs on GPUs that cannot hold it.
 
@@ -73,7 +73,7 @@ PR 25395 patched from `hy_v3` before conversion).
 ## Usage
 
 ```sh
-git clone -b hy3 https://github.com/giannisanni/neutronstar
+git clone https://github.com/giannisanni/neutronstar
 cd neutronstar && make ds4
 ./ds4 -m Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf --cuda --ssd-streaming \
   --ssd-streaming-cache-experts 64 --ctx 4096 --nothink

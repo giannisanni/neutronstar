@@ -24,7 +24,9 @@ campaign arc was 0.05 → 0.40 t/s generation and 0.30 → 6.5 t/s prefill on
 identical hardware, all software. HuggingFace tells you a 4060 Ti cannot run
 these models. HuggingFace is wrong, just slowly.
 
-This is the `hy3` branch: Hy3 support on top of everything in `glm-local`.
+This is `main`: every supported architecture lives here, and the engine
+dispatches on the GGUF arch string (`glm-5.2`, `hy-v3`) at load time. New
+model bring-ups happen on feature branches and land here when they work.
 
 ## The model
 
@@ -50,7 +52,7 @@ with the `hy-v3` arch string; a from-BF16 rebuild is in progress. Recipe and
 provenance are in the card. Both models live in the
 [NeutronStar collection](https://huggingface.co/collections/giannisan/neutronstar-6a509f2cc7cac276b1f066e0).
 
-## What this branch adds over upstream
+## What this fork adds over upstream
 
 ### Tencent Hy3 (295B) support
 ds4 was built entirely around MLA-family attention. Hy3 is Qwen3-shaped: plain
@@ -160,7 +162,7 @@ Plus `DS4_CUDA_ARENA_VRAM_RESERVE_GB` to keep VRAM headroom for batch kernels.
 ## Quick start
 
 ```sh
-git clone -b hy3 https://github.com/giannisanni/neutronstar
+git clone https://github.com/giannisanni/neutronstar
 cd neutronstar && make cuda CUDA_ARCH=sm_89
 
 # GLM-5.2 (743B)

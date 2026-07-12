@@ -14,7 +14,7 @@ rest() { curl -s --max-time 30 -X "$1" "https://rest.runpod.io/v1/$2" \
          ${3:+-d "$3"}; }
 
 echo "== 1. job script: fetched from the public repo (committed + pushed) =="
-RAW_URL="https://raw.githubusercontent.com/giannisanni/neutronstar/hy3/docs/ops/runpod-bf16/pod_job.sh"
+RAW_URL="https://raw.githubusercontent.com/giannisanni/neutronstar/main/docs/ops/runpod-bf16/pod_job.sh"
 # refuse to launch if the local script differs from what the pod will fetch
 if ! curl -sL --max-time 30 "$RAW_URL" | diff -q - "$HERE/pod_job.sh" >/dev/null; then
   echo "local pod_job.sh differs from $RAW_URL; commit + push first"; exit 1
