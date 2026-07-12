@@ -11,9 +11,9 @@ die() { echo "FATAL: $1" | tee -a "$LOG"; terminate 1; }
 terminate() {
   echo "JOB_EXIT rc=$1 $(date -u)" | tee -a "$LOG"
   # self-terminate the pod so billing stops even if nobody is watching
-  curl -s --max-time 30 "https://api.runpod.io/graphql?api_key=$RUNPOD_API_KEY" \
-    -H 'Content-Type: application/json' \
-    -d "{\"query\":\"mutation { podTerminate(input: {podId: \\\"$RUNPOD_POD_ID\\\"}) }\"}" >/dev/null
+  # (REST API; the legacy graphql?api_key= endpoint 403s for new rpa_ keys)
+  curl -s --max-time 30 -X DELETE "https://rest.runpod.io/v1/pods/$RUNPOD_POD_ID" \
+    -H "Authorization: Bearer $RUNPOD_API_KEY" >/dev/null
   exit "$1"
 }
 
@@ -68,11 +68,11 @@ mark "PHASE 5: quantize to ds4 recipe (uniform IQ2_XXS experts, Q8_0 rest)"
   --tensor-type 'ffn_(gate|up|down)_shexp\.weight=q8_0' \
   --tensor-type 'blk\.0\.ffn_(gate|up|down)\.weight=q8_0' \
   --token-embedding-type q8_0 --output-tensor-type q8_0 \
-  "$VOL/hy3-q8_0.gguf" "$VOL/Hy3-ds4-IQ2XXS-AttnQ8.gguf" iq2_xxs "$(nproc)" \
+  "$VOL/hy3-q8_0.gguf" "$VOL/Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf" iq2_xxs "$(nproc)" \
   >>"$LOG" 2>&1 || die "quantize"
 
 mark "PHASE 6: verify output header"
-python - "$VOL/Hy3-ds4-IQ2XXS-AttnQ8.gguf" <<'PY' >>"$LOG" 2>&1 || die "header verify"
+python - "$VOL/Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf" <<'PY' >>"$LOG" 2>&1 || die "header verify"
 import sys
 from gguf import GGUFReader
 r = GGUFReader(sys.argv[1])
@@ -94,8 +94,8 @@ PY
 mark "PHASE 7: upload to HF"
 [ -n "${CARD_B64:-}" ] && echo "$CARD_B64" | base64 -d > /tmp/README.md && \
   hf upload giannisan/Hy3-ds4-gguf /tmp/README.md README.md >>"$LOG" 2>&1
-hf upload giannisan/Hy3-ds4-gguf "$VOL/Hy3-ds4-IQ2XXS-AttnQ8.gguf" \
-  Hy3-ds4-IQ2XXS-AttnQ8.gguf >>"$LOG" 2>&1 || die "hf upload"
+hf upload giannisan/Hy3-ds4-gguf "$VOL/Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf" \
+  Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf >>"$LOG" 2>&1 || die "hf upload"
 hf upload giannisan/Hy3-ds4-gguf "$VOL/job.log" build-log.txt >>"$LOG" 2>&1
 
 mark "ALL DONE — self-terminating"

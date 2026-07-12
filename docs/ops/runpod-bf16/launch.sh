@@ -5,10 +5,13 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KEY=$(python3 -c "import re;print(re.search(r\"=\s*'([A-Za-z0-9_-]{20,})'\",open('$HOME/.runpod/config.toml').read()).group(1))")
-HF_TOKEN=${HF_TOKEN:-$(ssh gianni@substrate 'cat ~/.cache/huggingface/token' 2>/dev/null)}
-[ -z "$HF_TOKEN" ] && { echo "no HF token"; exit 1; }
-gql() { curl -s --max-time 30 "https://api.runpod.io/graphql?api_key=$KEY" \
-        -H 'Content-Type: application/json' -d "{\"query\":\"$1\"}"; }
+# NOTE: || true so a flaky ssh doesn't silently kill the script under set -e
+HF_TOKEN=${HF_TOKEN:-$(ssh -o ConnectTimeout=15 gianni@substrate 'cat ~/.cache/huggingface/token' 2>/dev/null || true)}
+[ -z "$HF_TOKEN" ] && { echo "no HF token (ssh to substrate failed?)"; exit 1; }
+# REST API: the legacy graphql?api_key= endpoint 403s for new rpa_ keys
+rest() { curl -s --max-time 30 -X "$1" "https://rest.runpod.io/v1/$2" \
+         -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+         ${3:+-d "$3"}; }
 
 echo "== 1. host the job script as a secret gist (no secrets inside it) =="
 GIST_URL=$(gh gist create --secret "$HERE/pod_job.sh" 2>/dev/null | tail -1)
@@ -17,8 +20,8 @@ echo "gist: $GIST_URL"
 
 echo "== 2. create 1.1TB network volume (>1TB tier = \$0.05/GB/mo) =="
 for DC in EU-RO-1 CA-MTL-1 EUR-IS-1 US-KS-2; do
-  R=$(gql "mutation { createNetworkVolume(input: {name: \\\"hy3-quant\\\", size: 1100, dataCenterId: \\\"$DC\\\"}) { id dataCenterId } }")
-  VOLID=$(echo "$R" | python3 -c "import json,sys;d=json.load(sys.stdin);print((d.get('data') or {}).get('createNetworkVolume',{}).get('id') or '')" 2>/dev/null)
+  R=$(rest POST networkvolumes "{\"name\":\"hy3-quant\",\"size\":1100,\"dataCenterId\":\"$DC\"}")
+  VOLID=$(echo "$R" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('id') or '')" 2>/dev/null)
   [ -n "$VOLID" ] && { echo "volume $VOLID in $DC"; break; }
   echo "  $DC: no ($(echo "$R" | head -c 120))"
 done
@@ -46,7 +49,7 @@ Launched. The job self-terminates the pod when done (or on any failure).
 Watch:   runpodctl pod list
 Result:  https://huggingface.co/giannisan/Hy3-ds4-gguf  (file + build-log.txt)
 AFTER SUCCESS, delete the volume (it bills until deleted!):
-  curl -s "https://api.runpod.io/graphql?api_key=\$KEY" -H 'Content-Type: application/json' \\
-    -d '{"query":"mutation { deleteNetworkVolume(input: {id: \\"$VOLID\\"}) }"}'
+  curl -s -X DELETE "https://rest.runpod.io/v1/networkvolumes/$VOLID" \\
+    -H "Authorization: Bearer \$KEY"
 Also delete the gist: gh gist delete ${GIST_URL##*/}
 EOF
