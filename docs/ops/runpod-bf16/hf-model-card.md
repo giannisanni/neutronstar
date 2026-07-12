@@ -25,15 +25,14 @@ interactive chat with KV retained across turns.
 
 ## Which file to download
 
-This repo has two files with the same recipe but different provenance:
-
-| File | Quantized from | Notes |
+| File | Quantized from | For |
 |---|---|---|
-| `Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf` | the original BF16 checkpoint | **recommended**: canonical single-step quantization |
-| `Hy3-ds4-IQ2XXS-AttnQ8.gguf` | the IQ4-UD edition of [YanissAmz/Hy3-295B-A21B-GGUF](https://huggingface.co/YanissAmz/Hy3-295B-A21B-GGUF) | the original build; a requantization of an existing quant |
+| `Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf` | the original BF16 checkpoint | **recommended** for 16GB cards: canonical single-step quantization |
+| `Hy3-ds4-IQ2XXS-AttnQ4-fromBF16.gguf` | the original BF16 checkpoint | 8GB cards: resident set (attention, shared expert, dense FFN, embeddings) at Q4_K instead of Q8_0, output head Q6_K; routed experts identical IQ2_XXS |
+| `Hy3-ds4-IQ2XXS-AttnQ8.gguf` | the IQ4-UD edition of [YanissAmz/Hy3-295B-A21B-GGUF](https://huggingface.co/YanissAmz/Hy3-295B-A21B-GGUF) | the original build; a requantization of an existing quant, kept for reproducibility |
 
-Both run identically in ds4 (same shapes, same slab sizes, same speed).
-The difference is quality margin: the older file went IQ4/IQ3 -> IQ2_XXS,
+The two AttnQ8 files run identically in ds4 (same shapes, same slab sizes,
+same speed). The difference is quality margin: the older file went IQ4/IQ3 -> IQ2_XXS,
 so its routed experts carry a second round of quantization noise. At a
 2-bit target the extra loss is small (the 2-bit noise dominates), but the
 fromBF16 build removes it entirely. The tensors that were already Q8_0 in
@@ -41,7 +40,13 @@ the source (attention, shared expert, dense FFN, embeddings, output head)
 passed through essentially lossless either way. The requant is kept for
 reproducibility and because early benchmarks were run on it.
 
-## Recipe (both files)
+The AttnQ4 file trades resident-set precision for VRAM: the streamed
+experts (the bulk of compute) are bit-identical to the AttnQ8 build, only
+the always-resident tensors drop to Q4_K, roughly halving the VRAM
+footprint so the model fits 8GB cards. Expect a modest quality dip on the
+attention path; the router and norms stay F32 in all files.
+
+## Recipe (AttnQ8 files; AttnQ4 swaps the Q8_0 rows for Q4_K, output head Q6_K)
 
 The layout targets ds4's streaming expert cache: routed experts must be
 uniform fixed-size slabs, and everything that makes decisions stays high
@@ -84,5 +89,6 @@ the accept loop cannot pay while expert streaming dominates eval cost);
 blk.80 is present in both files so it can be enabled later without
 requantizing.
 
-The fromBF16 file was built unattended on a RunPod CPU pod straight from
-the BF16 master; its build log is in this repo as build-log.txt.
+The fromBF16 files were built unattended on RunPod pods straight from
+the BF16 master; build logs are in this repo as build-log-attnq8.txt and
+build-log-attnq4.txt.

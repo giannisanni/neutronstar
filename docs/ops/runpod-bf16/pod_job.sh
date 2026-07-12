@@ -6,11 +6,19 @@
 set -uo pipefail
 VOL=/vol
 LOG="$VOL/job.log"
+# RECIPE selects the resident-set quant (experts always IQ2_XXS, streamed from SSD):
+#   attnq8: attn/shexp/dense/embd Q8_0 (16GB cards)   attnq4: Q4_K, output Q6_K (8GB cards)
+RECIPE="${RECIPE:-attnq8}"
+case "$RECIPE" in
+  attnq8) RES_T=q8_0; OUT_T=q8_0; EXPECT_EMBD=Q8_0; OUTFILE=Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf ;;
+  attnq4) RES_T=q4_K; OUT_T=q6_K; EXPECT_EMBD=Q4_K; OUTFILE=Hy3-ds4-IQ2XXS-AttnQ4-fromBF16.gguf ;;
+  *) echo "unknown RECIPE=$RECIPE"; exit 1 ;;
+esac
 mark() { echo "=== $1 $(date -u +%H:%M:%S) ===" | tee -a "$LOG"; }
 die() {
   echo "FATAL: $1" | tee -a "$LOG"
   # ship the log so failures are diagnosable (local volume dies with the pod)
-  hf upload giannisan/Hy3-ds4-gguf "$LOG" build-log-failed.txt >/dev/null 2>&1 || true
+  hf upload giannisan/Hy3-ds4-gguf "$LOG" "build-log-failed-$RECIPE.txt" >/dev/null 2>&1 || true
   terminate 1
 }
 terminate() {
@@ -64,23 +72,23 @@ python convert_hf_to_gguf.py "$VOL/bf16" --outtype q8_0 \
 rm -rf "$VOL/bf16"
 df -h "$VOL" | tee -a "$LOG"
 
-mark "PHASE 5: quantize to ds4 recipe (uniform IQ2_XXS experts, Q8_0 rest)"
+mark "PHASE 5: quantize to ds4 recipe (uniform IQ2_XXS experts, $RES_T rest, recipe=$RECIPE)"
 # NOTE: --tensor-type is unanchored regex_search; keep patterns anchored.
 # NOTE: NO pipes on this command (head/grep SIGPIPE killed earlier runs).
 ./build/bin/llama-quantize --allow-requantize --imatrix "$VOL/Hy3.imatrix.gguf" \
   --tensor-type 'blk\.([0-9]|[1-7][0-9])\.ffn_(gate|up|down)_exps\.weight=iq2_xxs' \
   --tensor-type 'blk\.80\.ffn_(gate|up|down)_exps\.weight=q2_k' \
   --tensor-type 'blk\.80\.nextn\.eh_proj\.weight=q8_0' \
-  --tensor-type 'attn_(q|k|v|output)\.weight=q8_0' \
-  --tensor-type 'ffn_(gate|up|down)_shexp\.weight=q8_0' \
-  --tensor-type 'blk\.0\.ffn_(gate|up|down)\.weight=q8_0' \
-  --token-embedding-type q8_0 --output-tensor-type q8_0 \
-  "$VOL/hy3-q8_0.gguf" "$VOL/Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf" iq2_xxs "$(nproc)" \
+  --tensor-type "attn_(q|k|v|output)\\.weight=$RES_T" \
+  --tensor-type "ffn_(gate|up|down)_shexp\\.weight=$RES_T" \
+  --tensor-type "blk\\.0\\.ffn_(gate|up|down)\\.weight=$RES_T" \
+  --token-embedding-type "$RES_T" --output-tensor-type "$OUT_T" \
+  "$VOL/hy3-q8_0.gguf" "$VOL/$OUTFILE" iq2_xxs "$(nproc)" \
   >>"$LOG" 2>&1 || die "quantize"
 
 mark "PHASE 6: verify output header"
-python - "$VOL/Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf" <<'PY' >>"$LOG" 2>&1 || die "header verify"
-import sys
+EXPECT_EMBD="$EXPECT_EMBD" python - "$VOL/$OUTFILE" <<'PY' >>"$LOG" 2>&1 || die "header verify"
+import os, sys
 from gguf import GGUFReader
 r = GGUFReader(sys.argv[1])
 f = r.fields["general.architecture"]
@@ -94,16 +102,16 @@ print("quant mix:", q)
 exps = [t for t in r.tensors if "ffn_gate_exps" in t.name]
 assert all("IQ2_XXS" in str(t.tensor_type) for t in exps), "experts not uniform IQ2_XXS"
 emb = [t for t in r.tensors if t.name == "token_embd.weight"][0]
-assert "Q8_0" in str(emb.tensor_type), "embd not Q8_0"
+want = os.environ["EXPECT_EMBD"]
+assert str(emb.tensor_type).endswith(want), f"embd {emb.tensor_type}, want {want}"
 print("HEADER_OK")
 PY
 
 mark "PHASE 7: upload to HF"
 [ -n "${CARD_B64:-}" ] && echo "$CARD_B64" | base64 -d > /tmp/README.md && \
   hf upload giannisan/Hy3-ds4-gguf /tmp/README.md README.md >>"$LOG" 2>&1
-hf upload giannisan/Hy3-ds4-gguf "$VOL/Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf" \
-  Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf >>"$LOG" 2>&1 || die "hf upload"
-hf upload giannisan/Hy3-ds4-gguf "$VOL/job.log" build-log.txt >>"$LOG" 2>&1
+hf upload giannisan/Hy3-ds4-gguf "$VOL/$OUTFILE" "$OUTFILE" >>"$LOG" 2>&1 || die "hf upload"
+hf upload giannisan/Hy3-ds4-gguf "$VOL/job.log" "build-log-$RECIPE.txt" >>"$LOG" 2>&1
 
 mark "ALL DONE — self-terminating"
 terminate 0

@@ -31,12 +31,13 @@ echo "job: $RAW_URL"
 # 598GB download), and CPU container disk is capped at ~10GB/vCPU. GPU pods
 # honor big local volumes; cheapest cards first, ~$0.2-0.5/hr.
 echo "== 2. create GPU pod (cheap card, 1.1TB local volume) =="
+RECIPE="${RECIPE:-attnq8}"   # attnq8 (16GB resident set) | attnq4 (8GB)
 CARD_B64=$(base64 < "$HERE/hf-model-card.md" | tr -d '\n')
-BODY=$(python3 - "$HF_TOKEN" "$KEY" "$RAW_URL" "$CARD_B64" << 'PYEOF'
+BODY=$(python3 - "$HF_TOKEN" "$KEY" "$RAW_URL" "$CARD_B64" "$RECIPE" << 'PYEOF'
 import json, sys
-hf, key, url, card = sys.argv[1:5]
+hf, key, url, card, recipe = sys.argv[1:6]
 print(json.dumps({
-  "name": "hy3-bf16-quant",
+  "name": "hy3-bf16-quant-" + recipe,
   "imageName": "python:3.11-bookworm",
   "cloudType": "SECURE",
   "gpuTypeIds": ["NVIDIA RTX 2000 Ada Generation", "NVIDIA RTX A4000",
@@ -46,7 +47,7 @@ print(json.dumps({
   "volumeInGb": 1100,
   "volumeMountPath": "/vol",
   "dockerStartCmd": ["bash", "-c", "curl -sL $JOB_URL -o /job.sh && bash /job.sh"],
-  "env": {"HF_TOKEN": hf, "RUNPOD_API_KEY": key, "JOB_URL": url, "CARD_B64": card},
+  "env": {"HF_TOKEN": hf, "RUNPOD_API_KEY": key, "JOB_URL": url, "CARD_B64": card, "RECIPE": recipe},
 }))
 PYEOF
 )
