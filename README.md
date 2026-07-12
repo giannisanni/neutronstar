@@ -12,8 +12,10 @@ attention and shared weights stay resident. Two models work end to end on one
   The 196.6 GiB file streams routed experts per token while ~20 GiB of
   attention/shared weights stay resident.
 - **Tencent Hy3** (295B / 21B-active MoE): a new grouped-query attention path
-  (ds4 was MLA-only), a ds4-native 2-bit quant, and interactive chat with KV
-  retained across turns. ~1.8 tok/s on the same card.
+  (ds4 was MLA-only), a ds4-native 2-bit quant, interactive chat with KV
+  retained across turns, and speculative cross-layer expert prefetch (the
+  next layer's router runs early so the SSD reads its experts while the GPU
+  is still on the current layer). ~2.1 tok/s on the same card.
 
 Reference machine: RTX 4060 Ti 16GB, 32GB DDR5, Ryzen 9900X, one NVMe. The GLM
 campaign arc was 0.05 → 0.40 t/s generation and 0.30 → 6.5 t/s prefill on
@@ -58,7 +60,7 @@ RoPE, a per-KV-head FP32 KV cache, and a single-pass online-softmax causal GQA
 kernel, all validated against a CPU reference by `ds4 --gqa-selftest` (no model
 file needed). The router, streaming expert cache, shared expert, dense layer,
 and nextn/MTP-layer handling are reused from the GLM plumbing. Result: Hy3 runs
-end to end with interactive chat, ~1.8 tok/s. The engine recognizes the model
+end to end with interactive chat, ~2.1 tok/s. The engine recognizes the model
 from the `hy-v3` GGUF arch string.
 
 ### GLM-5.2 CUDA port
@@ -77,9 +79,14 @@ had Q2_K down only).
 - **Host expert cache with LFU eviction**: expert popularity is concentrated
   enough that the hottest ~4% of experts serve ~30% of lookups, so a 7 GiB RAM
   cache removes ~30% of all disk traffic (`DS4_CUDA_HOST_EXPERT_CACHE_GB`).
-- **Cross-layer expert prefetch** (Fate-style router lookahead, 74% prediction
-  accuracy; throughput-neutral while the drive is saturated, armed for faster
-  disks, `DS4_GLM_EXPERT_PREFETCH=1`).
+- **Cross-layer expert prefetch** (Fate-style router lookahead,
+  `DS4_GLM_EXPERT_PREFETCH=1`): run layer N+1's router on layer N's hidden
+  state and read the predicted experts while the GPU is still computing.
+  Throughput-neutral on GLM while the drive was saturated (x1 link days);
+  on Hy3 with a full Gen4 x4 link it delivers **1.72 → 2.08 t/s (+21%)**,
+  host-cache hit rate 63% → 89%, disk busy 40% → 63%. Deeper lookahead via
+  `DS4_EXPERT_PREFETCH_DEPTH` (depth 2 loses on this drive: mispredicted
+  reads steal bandwidth demand fetches need; armed for Gen5).
 
 ### MTP speculative decoding for GLM 5.2 (first implementation anywhere)
 GLM-5.2 ships a draft head (blk.78) that no backend had wired up. This branch:
