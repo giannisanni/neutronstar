@@ -1,5 +1,7 @@
 # NeutronStar: giant MoE models on a single consumer GPU
 
+![NeutronStar](docs/assets/neutronstar-poster.png)
+
 A fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) that runs
 frontier Mixture-of-Experts language models on a GPU that has no business
 running them: the routed experts are streamed from SSD on every token while
