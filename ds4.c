@@ -34328,6 +34328,10 @@ typedef struct hy3_gpu_state {
     ds4_gpu_tensor *router_probs;    /* f32 [n_expert] */
     ds4_gpu_tensor *router_selected; /* i32 [n_expert_used] */
     ds4_gpu_tensor *router_weights;  /* f32 [n_expert_used] */
+    ds4_gpu_tensor *prefetch_logits;   /* f32 [n_expert] speculative next-layer router */
+    ds4_gpu_tensor *prefetch_probs;    /* f32 [n_expert] */
+    ds4_gpu_tensor *prefetch_selected; /* i32 [n_expert_used] */
+    ds4_gpu_tensor *prefetch_weights;  /* f32 [n_expert_used] */
     ds4_gpu_tensor *routed_gate; /* f32 [used*ff_exp] */
     ds4_gpu_tensor *routed_up;   /* f32 [used*ff_exp] */
     ds4_gpu_tensor *routed_mid;  /* f32 [used*ff_exp] */
@@ -34356,6 +34360,8 @@ static void hy3_state_free(hy3_gpu_state *s) {
     ds4_gpu_tensor_free(s->shared_mid); ds4_gpu_tensor_free(s->shared_out);
     ds4_gpu_tensor_free(s->router_logits); ds4_gpu_tensor_free(s->router_probs);
     ds4_gpu_tensor_free(s->router_selected); ds4_gpu_tensor_free(s->router_weights);
+    ds4_gpu_tensor_free(s->prefetch_logits); ds4_gpu_tensor_free(s->prefetch_probs);
+    ds4_gpu_tensor_free(s->prefetch_selected); ds4_gpu_tensor_free(s->prefetch_weights);
     ds4_gpu_tensor_free(s->routed_gate); ds4_gpu_tensor_free(s->routed_up);
     ds4_gpu_tensor_free(s->routed_mid); ds4_gpu_tensor_free(s->routed_down);
     ds4_gpu_tensor_free(s->routed_out);
@@ -34401,6 +34407,10 @@ static bool hy3_state_alloc(
     s->router_probs = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
     s->router_selected = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
     s->router_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+    s->prefetch_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    s->prefetch_probs = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    s->prefetch_selected = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+    s->prefetch_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
     s->routed_gate = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
     s->routed_up = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
     s->routed_mid = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
@@ -34413,7 +34423,9 @@ static bool hy3_state_alloc(
         !s->dense_gate || !s->dense_up || !s->dense_mid ||
         !s->shared_mid || !s->shared_out ||
         !s->router_logits || !s->router_probs || !s->router_selected ||
-        !s->router_weights || !s->routed_gate || !s->routed_up ||
+        !s->router_weights ||
+        !s->prefetch_logits || !s->prefetch_probs || !s->prefetch_selected ||
+        !s->prefetch_weights || !s->routed_gate || !s->routed_up ||
         !s->routed_mid || !s->routed_down || !s->routed_out ||
         !s->out_norm || !s->logits) {
         hy3_state_free(s);
@@ -34443,6 +34455,67 @@ static bool hy3_state_alloc(
         }
     }
     return true;
+}
+
+/* Speculative cross-layer expert prefetch for the Hy3 path: approximate
+ * layer il+1's router input with layer il's normed hidden state, run the
+ * next layer's router on it, and start pulling the predicted experts into
+ * the host expert cache while il's demand load and MoE compute run.  Same
+ * mechanism as glm_graph_prefetch_next_layer_experts; mispredictions only
+ * cost idle disk bandwidth.  Opt in with DS4_GLM_EXPERT_PREFETCH=1 (needs
+ * the io_uring fetch engine). */
+static void hy3_prefetch_next_layer_experts(
+        hy3_gpu_state     *s,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_GLM_EXPERT_PREFETCH");
+        enabled = env && env[0] == '1';
+    }
+    if (!enabled || !s->ssd_streaming) return;
+    const uint32_t nl = il + 1;
+    if (nl >= s->n_exec_layer || nl < DS4_N_LEADING_DENSE) return;
+    const ds4_layer_weights *ln = &weights->layer[nl];
+    if (!ln->ffn_gate_inp || !ln->ffn_exp_probs_b ||
+        !ln->ffn_gate_exps || !ln->ffn_up_exps || !ln->ffn_down_exps) {
+        return;
+    }
+    if (!ds4_gpu_matmul_f32_tensor(s->prefetch_logits, model->map,
+            model->size, ln->ffn_gate_inp->abs_offset,
+            DS4_N_EMBD, DS4_N_EXPERT, s->ffn_norm, 1)) {
+        return;
+    }
+    if (!ds4_gpu_glm_router_select_tensor(s->prefetch_selected,
+            s->prefetch_weights, s->prefetch_probs, model->map, model->size,
+            ln->ffn_exp_probs_b->abs_offset, s->prefetch_logits,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE)) {
+        return;
+    }
+    uint64_t gate_in = 0, gate_out = 0, gate_row = 0;
+    uint64_t down_in = 0, down_out = 0, down_row = 0;
+    (void)tensor_expert_bytes(model, ln->ffn_gate_exps, 0,
+                              &gate_in, &gate_out, &gate_row);
+    (void)tensor_expert_bytes(model, ln->ffn_down_exps, 0,
+                              &down_in, &down_out, &down_row);
+    if (gate_out == 0 || gate_row == 0 || down_out == 0 || down_row == 0) {
+        return;
+    }
+    const ds4_gpu_stream_expert_table table = {
+        .model_map = model->map,
+        .model_size = model->size,
+        .layer = nl,
+        .n_total_expert = DS4_N_EXPERT,
+        .gate_offset = ln->ffn_gate_exps->abs_offset,
+        .up_offset = ln->ffn_up_exps->abs_offset,
+        .down_offset = ln->ffn_down_exps->abs_offset,
+        .gate_expert_bytes = gate_out * gate_row,
+        .down_expert_bytes = down_out * down_row,
+    };
+    (void)ds4_gpu_stream_expert_cache_prefetch(&table,
+                                               s->prefetch_selected,
+                                               DS4_N_EXPERT_USED);
 }
 
 /* One full forward for one token at absolute position pos.  Reads the
@@ -34528,6 +34601,10 @@ static bool hy3_forward_token(
                 s->router_weights, s->router_probs, model->map, model->size,
                 l->ffn_exp_probs_b->abs_offset, s->router_logits,
                 DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE) != 0;
+        /* Fire next-layer expert prefetch before this layer's demand load:
+         * the ring interleaves both and predictions get the whole demand
+         * window plus this layer's MoE compute to land. */
+        if (ok) hy3_prefetch_next_layer_experts(s, model, weights, il);
         uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
         uint64_t up_in = 0, up_out = 0, up_row_bytes = 0;
         uint64_t down_in = 0, down_out = 0, down_row_bytes = 0;
