@@ -88,6 +88,11 @@ had Q2_K down only).
 - **Host expert cache with LFU eviction**: expert popularity is concentrated
   enough that the hottest ~4% of experts serve ~30% of lookups, so a 7 GiB RAM
   cache removes ~30% of all disk traffic (`DS4_CUDA_HOST_EXPERT_CACHE_GB`).
+- **Host-cache warm start** (`DS4_CUDA_HOST_CACHE_STATE=file`): the cache
+  index (offsets, sizes, hit counts; ~200KB, never the 16GB of data) persists
+  across runs, and a background thread re-reads the entries in offset order
+  at startup: 12.2 GiB warm in 13 s. Sessions open at ~84% hit rate on the
+  first 2048 lookups instead of ~59% cold and minutes of climbing.
 - **Cross-layer expert prefetch** (Fate-style router lookahead,
   `DS4_GLM_EXPERT_PREFETCH=1`): run layer N+1's router on layer N's hidden
   state and read the predicted experts while the GPU is still computing.

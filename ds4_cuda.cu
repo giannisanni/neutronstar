@@ -2387,6 +2387,14 @@ static uint64_t g_host_cache_tick;
 static uint64_t g_host_cache_hits;
 static uint64_t g_host_cache_misses;
 static int g_host_cache_checked;
+/* Warm-state persistence (DS4_CUDA_HOST_CACHE_STATE=file): the slot table is
+ * main-thread except for the background warm loader, so every table access
+ * takes this lock. get() pointers stay safe because the warm thread never
+ * evicts a valid slot (it only fills empty ones). */
+static pthread_mutex_t g_host_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static const char *g_host_cache_state_path;
+static void cuda_host_cache_state_save(void);
+static void cuda_host_cache_warm_start(void);
 
 static void cuda_host_cache_init(void) {
     if (g_host_cache_checked) return;
@@ -2409,6 +2417,12 @@ static void cuda_host_cache_init(void) {
     fprintf(stderr,
             "ds4: CUDA host expert cache enabled: %llu GiB budget, %u slots\n",
             gb, g_host_cache_nslots);
+    const char *state = getenv("DS4_CUDA_HOST_CACHE_STATE");
+    if (state && state[0]) {
+        g_host_cache_state_path = strdup(state);
+        atexit(cuda_host_cache_state_save);
+        cuda_host_cache_warm_start();
+    }
 }
 
 static uint32_t cuda_host_cache_bucket(uint64_t offset) {
@@ -2431,6 +2445,7 @@ static void cuda_host_cache_report(void) {
 
 static const void *cuda_host_cache_get(uint64_t offset, uint64_t bytes) {
     if (g_host_cache_nslots == 0) return NULL;
+    pthread_mutex_lock(&g_host_cache_lock);
     const uint32_t h = cuda_host_cache_bucket(offset);
     for (uint32_t i = 0; i < CUDA_HOST_CACHE_WAYS; i++) {
         cuda_host_cache_slot *s =
@@ -2440,11 +2455,13 @@ static const void *cuda_host_cache_get(uint64_t offset, uint64_t bytes) {
             s->uses++;
             g_host_cache_hits++;
             cuda_host_cache_report();
+            pthread_mutex_unlock(&g_host_cache_lock);
             return (const char *)s->buf + s->payload_off;
         }
     }
     g_host_cache_misses++;
     cuda_host_cache_report();
+    pthread_mutex_unlock(&g_host_cache_lock);
     return NULL;
 }
 
@@ -2452,24 +2469,35 @@ static const void *cuda_host_cache_get(uint64_t offset, uint64_t bytes) {
  * the speculative prefetcher to skip experts that are already resident. */
 static int cuda_host_cache_contains(uint64_t offset, uint64_t bytes) {
     if (g_host_cache_nslots == 0) return 0;
+    pthread_mutex_lock(&g_host_cache_lock);
     const uint32_t h = cuda_host_cache_bucket(offset);
+    int found = 0;
     for (uint32_t i = 0; i < CUDA_HOST_CACHE_WAYS; i++) {
         const cuda_host_cache_slot *s =
             &g_host_cache_slots[(h + i) % g_host_cache_nslots];
-        if (s->valid && s->offset == offset && s->bytes == bytes) return 1;
+        if (s->valid && s->offset == offset && s->bytes == bytes) {
+            found = 1;
+            break;
+        }
     }
-    return 0;
+    pthread_mutex_unlock(&g_host_cache_lock);
+    return found;
 }
 
 static uint64_t g_host_cache_inserts;
 
 /* Takes ownership of buf; frees it if not inserted. The payload (bytes long)
- * starts at buf + payload_off, which is nonzero for O_DIRECT-aligned reads. */
-static void cuda_host_cache_insert_owned(uint64_t offset,
-                                         uint64_t bytes,
-                                         void *buf,
-                                         uint32_t payload_off,
-                                         int aligned_buf) {
+ * starts at buf + payload_off, which is nonzero for O_DIRECT-aligned reads.
+ * allow_evict=0 (the warm loader) only fills empty slots: evicting from a
+ * background thread could free a buffer the main thread just got. */
+static void cuda_host_cache_insert_locked(uint64_t offset,
+                                          uint64_t bytes,
+                                          void *buf,
+                                          uint32_t payload_off,
+                                          int aligned_buf,
+                                          int allow_evict,
+                                          uint64_t seed_uses,
+                                          int *want_dump) {
     cuda_host_cache_slot incoming;
     incoming.buf = buf;
     incoming.bytes = bytes;
@@ -2485,6 +2513,7 @@ static void cuda_host_cache_insert_owned(uint64_t offset,
             g_host_cache_slots[i].uses >>= 1;
         }
     }
+    if (want_dump && (g_host_cache_inserts & 8191u) == 0) *want_dump = 1;
     const uint32_t h = cuda_host_cache_bucket(offset);
     cuda_host_cache_slot *victim = NULL;   /* empty slot if available */
     cuda_host_cache_slot *lfu = NULL;      /* least-used valid entry in window */
@@ -2510,10 +2539,12 @@ static void cuda_host_cache_insert_owned(uint64_t offset,
      * the table does, and refusing inserts would freeze the cache contents.
      * Frequency-weighted eviction protects repeatedly hit experts from being
      * flushed by one-shot streams (pure LRU thrashes at these cache sizes). */
-    if (g_host_cache_used + bytes > g_host_cache_budget && lfu) {
-        victim = lfu;
-    } else if (!victim) {
-        victim = lfu;
+    if (allow_evict) {
+        if (g_host_cache_used + bytes > g_host_cache_budget && lfu) {
+            victim = lfu;
+        } else if (!victim) {
+            victim = lfu;
+        }
     }
     if (!victim) {
         cuda_host_cache_release_buf(&incoming);
@@ -2531,12 +2562,192 @@ static void cuda_host_cache_insert_owned(uint64_t offset,
     victim->offset = offset;
     victim->bytes = bytes;
     victim->age = ++g_host_cache_tick;
-    victim->uses = 1;
+    victim->uses = seed_uses != 0 ? seed_uses : 1;
     victim->buf = buf;
     victim->payload_off = payload_off;
     victim->aligned_buf = incoming.aligned_buf;
     victim->valid = 1;
     g_host_cache_used += bytes;
+}
+
+static void cuda_host_cache_insert_owned(uint64_t offset,
+                                         uint64_t bytes,
+                                         void *buf,
+                                         uint32_t payload_off,
+                                         int aligned_buf) {
+    int want_dump = 0;
+    pthread_mutex_lock(&g_host_cache_lock);
+    cuda_host_cache_insert_locked(offset, bytes, buf, payload_off,
+                                  aligned_buf, 1, 0, &want_dump);
+    pthread_mutex_unlock(&g_host_cache_lock);
+    if (want_dump && g_host_cache_state_path) cuda_host_cache_state_save();
+}
+
+/* ---- Host-cache warm state: persist the (offset, bytes, uses) index and
+ * re-read those experts from disk at the next startup, so sessions begin
+ * at steady-state hit rate instead of climbing from 0%. Data is NOT saved
+ * (it is 16GB of quant blocks already on disk); only the index is. ---- */
+
+#define CUDA_HOST_CACHE_STATE_MAGIC 0x31434834445344ull /* "DS4D4HC1" */
+
+static void cuda_host_cache_state_save(void) {
+    if (!g_host_cache_state_path || g_host_cache_nslots == 0 ||
+        g_model_file_size == 0) {
+        return;
+    }
+    char tmp[4096];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", g_host_cache_state_path) >=
+            (int)sizeof(tmp)) {
+        return;
+    }
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    pthread_mutex_lock(&g_host_cache_lock);
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < g_host_cache_nslots; i++) {
+        if (g_host_cache_slots[i].valid) count++;
+    }
+    const uint64_t magic = CUDA_HOST_CACHE_STATE_MAGIC;
+    int ok = fwrite(&magic, sizeof(magic), 1, f) == 1 &&
+             fwrite(&g_model_file_size, sizeof(g_model_file_size), 1, f) == 1 &&
+             fwrite(&count, sizeof(count), 1, f) == 1;
+    for (uint32_t i = 0; ok && i < g_host_cache_nslots; i++) {
+        const cuda_host_cache_slot *s = &g_host_cache_slots[i];
+        if (!s->valid) continue;
+        const uint32_t uses32 = s->uses > UINT32_MAX ? UINT32_MAX
+                                                     : (uint32_t)s->uses;
+        ok = fwrite(&s->offset, sizeof(s->offset), 1, f) == 1 &&
+             fwrite(&s->bytes, sizeof(s->bytes), 1, f) == 1 &&
+             fwrite(&uses32, sizeof(uses32), 1, f) == 1;
+    }
+    pthread_mutex_unlock(&g_host_cache_lock);
+    ok = fclose(f) == 0 && ok;
+    if (ok) {
+        (void)rename(tmp, g_host_cache_state_path);
+    } else {
+        (void)unlink(tmp);
+    }
+}
+
+typedef struct { uint64_t offset, bytes; uint32_t uses; } cuda_warm_entry;
+
+static int cuda_warm_entry_cmp(const void *a, const void *b) {
+    const uint64_t oa = ((const cuda_warm_entry *)a)->offset;
+    const uint64_t ob = ((const cuda_warm_entry *)b)->offset;
+    return oa < ob ? -1 : oa > ob ? 1 : 0;
+}
+
+static void *cuda_host_cache_warm_thread(void *arg) {
+    (void)arg;
+    /* model fds are set during model load, which may still be in flight */
+    for (int i = 0; i < 600 && g_model_fd < 0; i++) usleep(100000);
+    if (g_model_fd < 0 || g_model_file_size == 0) return NULL;
+    FILE *f = fopen(g_host_cache_state_path, "rb");
+    if (!f) return NULL;
+    uint64_t magic = 0, msize = 0;
+    uint32_t count = 0;
+    if (fread(&magic, sizeof(magic), 1, f) != 1 ||
+        magic != CUDA_HOST_CACHE_STATE_MAGIC ||
+        fread(&msize, sizeof(msize), 1, f) != 1 ||
+        fread(&count, sizeof(count), 1, f) != 1 ||
+        count == 0 || count > 262144) {
+        if (magic != 0 && msize != g_model_file_size) {
+            fprintf(stderr,
+                    "ds4: host cache warm state is for a different model file; ignoring\n");
+        }
+        fclose(f);
+        return NULL;
+    }
+    if (msize != g_model_file_size) {
+        fprintf(stderr,
+                "ds4: host cache warm state is for a different model file; ignoring\n");
+        fclose(f);
+        return NULL;
+    }
+    cuda_warm_entry *ents =
+        (cuda_warm_entry *)malloc((size_t)count * sizeof(*ents));
+    if (!ents) {
+        fclose(f);
+        return NULL;
+    }
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        cuda_warm_entry e;
+        if (fread(&e.offset, sizeof(e.offset), 1, f) != 1 ||
+            fread(&e.bytes, sizeof(e.bytes), 1, f) != 1 ||
+            fread(&e.uses, sizeof(e.uses), 1, f) != 1) {
+            break;
+        }
+        if (e.bytes == 0 || e.bytes > CUDA_HOST_CACHE_MAX_ENTRY ||
+            e.offset > g_model_file_size ||
+            e.bytes > g_model_file_size - e.offset) {
+            continue;
+        }
+        ents[n++] = e;
+    }
+    fclose(f);
+    /* offset order: the drive sees a mostly sequential sweep */
+    qsort(ents, n, sizeof(*ents), cuda_warm_entry_cmp);
+    const uint64_t align = g_model_direct_align > 1 ? g_model_direct_align : 4096;
+    const int use_direct = g_model_direct_fd >= 0;
+    uint64_t warmed = 0, skipped = 0, next_report = 4ull << 30;
+    const double t0 = (double)time(NULL);
+    for (uint32_t i = 0; i < n; i++) {
+        const cuda_warm_entry *e = &ents[i];
+        if (cuda_host_cache_contains(e->offset, e->bytes)) {
+            skipped++;
+            continue;
+        }
+        const uint64_t aligned_off = use_direct ? (e->offset & ~(align - 1u))
+                                                : e->offset;
+        const uint64_t payload = e->offset - aligned_off;
+        const uint64_t read_len = use_direct ?
+                ((payload + e->bytes + align - 1u) / align) * align : e->bytes;
+        void *buf = NULL;
+        if (use_direct) {
+            if (posix_memalign(&buf, (size_t)align, (size_t)read_len) != 0) break;
+        } else {
+            buf = malloc((size_t)read_len);
+            if (!buf) break;
+        }
+        uint64_t done = 0;
+        const int fd = use_direct ? g_model_direct_fd : g_model_fd;
+        while (done < read_len) {
+            ssize_t r = pread(fd, (char *)buf + done, read_len - done,
+                              (off_t)(aligned_off + done));
+            if (r <= 0) break;
+            done += (uint64_t)r;
+        }
+        if (done < read_len) {
+            free(buf);
+            continue;
+        }
+        pthread_mutex_lock(&g_host_cache_lock);
+        cuda_host_cache_insert_locked(e->offset, e->bytes, buf,
+                                      (uint32_t)payload, 0, 0, e->uses, NULL);
+        pthread_mutex_unlock(&g_host_cache_lock);
+        warmed += e->bytes;
+        if (warmed >= next_report) {
+            fprintf(stderr, "ds4: host cache warm: %.1f GiB loaded\n",
+                    (double)warmed / 1073741824.0);
+            next_report += 4ull << 30;
+        }
+    }
+    free(ents);
+    fprintf(stderr,
+            "ds4: host cache warm done: %.2f GiB in %.0fs (%u entries, %llu already present)\n",
+            (double)warmed / 1073741824.0,
+            (double)time(NULL) - t0,
+            n,
+            (unsigned long long)skipped);
+    return NULL;
+}
+
+static void cuda_host_cache_warm_start(void) {
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, cuda_host_cache_warm_thread, NULL) == 0) {
+        pthread_detach(tid);
+    }
 }
 
 /* Parallel expert fetch.  The selected-expert loader issues up to
