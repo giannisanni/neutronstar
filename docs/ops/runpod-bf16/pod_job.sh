@@ -7,7 +7,12 @@ set -uo pipefail
 VOL=/vol
 LOG="$VOL/job.log"
 mark() { echo "=== $1 $(date -u +%H:%M:%S) ===" | tee -a "$LOG"; }
-die() { echo "FATAL: $1" | tee -a "$LOG"; terminate 1; }
+die() {
+  echo "FATAL: $1" | tee -a "$LOG"
+  # ship the log so failures are diagnosable (local volume dies with the pod)
+  hf upload giannisan/Hy3-ds4-gguf "$LOG" build-log-failed.txt >/dev/null 2>&1 || true
+  terminate 1
+}
 terminate() {
   echo "JOB_EXIT rc=$1 $(date -u)" | tee -a "$LOG"
   # self-terminate the pod so billing stops even if nobody is watching
@@ -18,9 +23,11 @@ terminate() {
 }
 
 mark "PHASE 0: deps"
+# hf first so die() can ship the log from any later phase
+pip install -q --no-cache-dir "huggingface_hub[hf_transfer]" || { echo "FATAL: pip hf" | tee -a "$LOG"; terminate 1; }
 apt-get update -qq && apt-get install -y -qq cmake g++ git curl aria2 >/dev/null 2>&1 || die "apt"
 pip install -q --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu || die "torch cpu"
-pip install -q --no-cache-dir "huggingface_hub[hf_transfer]" gguf safetensors "transformers>=4.45" sentencepiece pyyaml || die "pip deps"
+pip install -q --no-cache-dir gguf safetensors "transformers>=4.45" sentencepiece pyyaml || die "pip deps"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 mark "PHASE 1: network speed gate"
