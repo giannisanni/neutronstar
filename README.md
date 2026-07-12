@@ -105,6 +105,18 @@ had Q2_K down only).
   `DS4_EXPERT_PREFETCH_DEPTH` (depth 2 loses on this drive: mispredicted
   reads steal bandwidth demand fetches need; armed for Gen5).
 
+### Hy3 MTP draft head: probed and measured too weak
+Hy3 ships a nextn/MTP layer (blk.80) like GLM's, and this fork carries a
+full draft-head implementation for it (DeepSeek-style nextn glue, blk.80
+as a GQA+MoE layer over a draft KV window, shared output head). The probe
+(`DS4_HY3_MTP_PROBE=1`) measures d1 acceptance at greedy decode: **~30%**
+(29/95), versus 95% for GLM's head on the same rig. Controls: swapped
+concat order scores 0% (so the glue is right), offset+2 scores 4% (so
+there is no off-by-one). At 30% acceptance a 2-token verify yields ~1.3
+tokens for ~1.35x the cost, a net loss, so the accept loop is not wired.
+The probe stays as a diagnostic for future hy-v3 checkpoints with
+stronger heads.
+
 ### MTP speculative decoding for GLM 5.2 (first implementation anywhere)
 GLM-5.2 ships a draft head (blk.78) that no backend had wired up. This branch:
 - binds it from the main gguf (no separate draft file, pass the same path to

@@ -34346,6 +34346,14 @@ typedef struct hy3_gpu_state {
     ds4_gpu_tensor **vcache;
     ds4_gpu_tensor **qn;         /* f32 [head_dim] qk-norm weights */
     ds4_gpu_tensor **kn;
+    /* MTP draft head (blk.80), allocated lazily on first draft */
+    ds4_gpu_tensor *dk, *dv;     /* draft KV caches */
+    ds4_gpu_tensor *dqn, *dkn;   /* blk.80 qk-norm weights */
+    ds4_gpu_tensor *d_concat;    /* f32 [2*embd] nextn glue */
+    ds4_gpu_tensor *d_hnorm;     /* f32 [embd] */
+    uint32_t mtp_base;           /* absolute pos of draft cache row 0 */
+    int mtp_have;                /* draft state initialized */
+    int mtp_broken;              /* alloc failed once; stop trying */
     bool ssd_streaming;
 } hy3_gpu_state;
 
@@ -34368,6 +34376,9 @@ static void hy3_state_free(hy3_gpu_state *s) {
     ds4_gpu_tensor_free(s->routed_mid); ds4_gpu_tensor_free(s->routed_down);
     ds4_gpu_tensor_free(s->routed_out);
     ds4_gpu_tensor_free(s->out_norm); ds4_gpu_tensor_free(s->logits);
+    ds4_gpu_tensor_free(s->dk); ds4_gpu_tensor_free(s->dv);
+    ds4_gpu_tensor_free(s->dqn); ds4_gpu_tensor_free(s->dkn);
+    ds4_gpu_tensor_free(s->d_concat); ds4_gpu_tensor_free(s->d_hnorm);
     for (uint32_t il = 0; s->kcache && il < s->n_exec_layer; il++) {
         ds4_gpu_tensor_free(s->kcache[il]);
         ds4_gpu_tensor_free(s->vcache[il]);
@@ -34922,6 +34933,170 @@ static bool hy3_forward_token(
     return ok;
 }
 
+/* Hy3 MTP draft head (blk.80): DeepSeek-style nextn. Consumes the main
+ * model's final hidden state h(pos-1) (still in s->cur after the forward
+ * that produced the logits) plus the embedding of the token placed at pos,
+ * runs blk.80 as a normal GQA+MoE layer over a draft-only KV window, and
+ * returns draft logits predicting the token at pos+1. Draft cache rows are
+ * (pos - mtp_base): keys carry real-position RoPE, the window just starts
+ * at the first drafted position (truncated context, same contract as the
+ * GLM draft window). */
+static bool hy3_mtp_draft(
+        hy3_gpu_state     *s,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        int                token,
+        uint32_t           pos,
+        float             *logits_out) {
+    if (s->mtp_broken || token < 0 || token >= (int)DS4_N_VOCAB) return false;
+    const uint32_t il = DS4_N_LAYER - 1u; /* blk.80 */
+    const ds4_layer_weights *l = &weights->layer[il];
+    if (!l->nextn_eh_proj || !l->nextn_enorm || !l->nextn_hnorm ||
+        !l->nextn_shared_head_norm || !l->attn_norm || !l->attn_q_norm ||
+        !l->attn_k_norm || !l->ffn_gate_inp || !l->ffn_exp_probs_b ||
+        !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
+        !l->ffn_gate_shexp || !l->ffn_up_shexp || !l->ffn_down_shexp) {
+        s->mtp_broken = 1;
+        return false;
+    }
+    const uint64_t embd = DS4_N_EMBD, hd = DS4_N_HEAD_DIM;
+    if (!s->dk) {
+        const uint64_t cache_bytes =
+            (uint64_t)DS4_N_HEAD_KV * s->ctx * hd * sizeof(float);
+        s->dk = ds4_gpu_tensor_alloc(cache_bytes);
+        s->dv = ds4_gpu_tensor_alloc(cache_bytes);
+        s->dqn = ds4_gpu_tensor_alloc(hd * sizeof(float));
+        s->dkn = ds4_gpu_tensor_alloc(hd * sizeof(float));
+        s->d_concat = ds4_gpu_tensor_alloc(2u * embd * sizeof(float));
+        s->d_hnorm = ds4_gpu_tensor_alloc(embd * sizeof(float));
+        if (!s->dk || !s->dv || !s->dqn || !s->dkn || !s->d_concat ||
+            !s->d_hnorm ||
+            ds4_gpu_tensor_write(s->dqn, 0,
+                                 tensor_data(model, l->attn_q_norm),
+                                 hd * sizeof(float)) == 0 ||
+            ds4_gpu_tensor_write(s->dkn, 0,
+                                 tensor_data(model, l->attn_k_norm),
+                                 hd * sizeof(float)) == 0) {
+            fprintf(stderr, "ds4: hy3 mtp draft buffers unavailable\n");
+            s->mtp_broken = 1;
+            return false;
+        }
+    }
+    if (!s->mtp_have || pos < s->mtp_base || pos - s->mtp_base >= s->ctx) {
+        s->mtp_base = pos;
+        s->mtp_have = 1;
+    }
+    const uint32_t row = pos - s->mtp_base;
+    const uint64_t emb_bytes = embd * sizeof(float);
+
+    /* nextn glue: concat(enorm(embed(token)), hnorm(h)) -> eh_proj -> cur */
+    bool ok = ds4_gpu_rms_norm_weight_tensor(s->d_hnorm, s->cur,
+            model->map, model->size, l->nextn_hnorm->abs_offset,
+            DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_embed_token_q8_0_tensor(s->attn_out, model->map,
+            model->size, weights->token_embd->abs_offset,
+            DS4_N_VOCAB, (uint32_t)token, DS4_N_EMBD) != 0;
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(s->attn_norm, s->attn_out,
+            model->map, model->size, l->nextn_enorm->abs_offset,
+            DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    /* concat order (e,h), DeepSeek/GLM convention; (h,e) measured 0% */
+    if (ok) ok = ds4_gpu_tensor_copy(s->d_concat, 0, s->attn_norm, 0,
+            emb_bytes) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(s->d_concat, emb_bytes, s->d_hnorm, 0,
+            emb_bytes) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->cur, model->map, model->size,
+            l->nextn_eh_proj->abs_offset, 2u * DS4_N_EMBD, DS4_N_EMBD,
+            s->d_concat, 1) != 0;
+
+    /* blk.80 attention over the draft window */
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(s->attn_norm, s->cur,
+            model->map, model->size, l->attn_norm->abs_offset,
+            DS4_N_EMBD, 1, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->q, model->map, model->size,
+            l->attn_q->abs_offset, DS4_N_EMBD,
+            (uint64_t)DS4_N_HEAD * hd, s->attn_norm, 1) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->k, model->map, model->size,
+            l->attn_k->abs_offset, DS4_N_EMBD,
+            (uint64_t)DS4_N_HEAD_KV * hd, s->attn_norm, 1) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->v, model->map, model->size,
+            l->attn_v->abs_offset, DS4_N_EMBD,
+            (uint64_t)DS4_N_HEAD_KV * hd, s->attn_norm, 1) != 0;
+    if (ok) ok = ds4_gpu_gqa_head_rms_norm_weight(s->q, s->dqn,
+            DS4_N_HEAD, hd, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_gqa_head_rms_norm_weight(s->k, s->dkn,
+            DS4_N_HEAD_KV, hd, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_gqa_rope(s->q, 1, DS4_N_HEAD, hd,
+            pos, DS4_ROPE_FREQ_BASE) != 0;
+    if (ok) ok = ds4_gpu_gqa_rope(s->k, 1, DS4_N_HEAD_KV, hd,
+            pos, DS4_ROPE_FREQ_BASE) != 0;
+    if (ok) ok = ds4_gpu_gqa_kv_cache_append(s->dk, s->k, 1,
+            DS4_N_HEAD_KV, hd, s->ctx, row) != 0;
+    if (ok) ok = ds4_gpu_gqa_kv_cache_append(s->dv, s->v, 1,
+            DS4_N_HEAD_KV, hd, s->ctx, row) != 0;
+    if (ok) ok = ds4_gpu_gqa_attention(s->heads, s->q, s->dk, s->dv, 1,
+            DS4_N_HEAD, DS4_N_HEAD_KV, hd, s->ctx, row) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->attn_out, model->map,
+            model->size, l->attn_output->abs_offset,
+            (uint64_t)DS4_N_HEAD * hd, DS4_N_EMBD, s->heads, 1) != 0;
+    if (ok) ok = ds4_gpu_add_tensor(s->after_attn, s->cur, s->attn_out,
+            DS4_N_EMBD) != 0;
+
+    /* blk.80 MoE ffn (Q2_K experts: the GLM MoE launcher handles that
+     * quant; the layer is off the streaming slab class so weights come
+     * from model views / the VRAM weight cache, not the expert cache) */
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(s->ffn_norm,
+            s->after_attn, model->map, model->size,
+            l->ffn_norm->abs_offset, DS4_N_EMBD, 1, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_matmul_f32_tensor(s->router_logits, model->map,
+            model->size, l->ffn_gate_inp->abs_offset,
+            DS4_N_EMBD, DS4_N_EXPERT, s->ffn_norm, 1) != 0;
+    if (ok) ok = ds4_gpu_glm_router_select_tensor(s->router_selected,
+            s->router_weights, s->router_probs, model->map, model->size,
+            l->ffn_exp_probs_b->abs_offset, s->router_logits,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE) != 0;
+    if (ok) ok = ds4_gpu_shared_mid_swiglu_q8_0_tensor(s->shared_mid,
+            model->map, model->size,
+            l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+            DS4_N_EMBD, DS4_N_FF_EXP, s->ffn_norm, 0.0f) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->shared_out, model->map,
+            model->size, l->ffn_down_shexp->abs_offset,
+            DS4_N_FF_EXP, DS4_N_EMBD, s->shared_mid, 1) != 0;
+    if (ok) {
+        uint64_t gi = 0, go = 0, gr = 0, ui = 0, uo = 0, ur = 0;
+        uint64_t di = 0, dn = 0, dr = 0;
+        (void)tensor_expert_bytes(model, l->ffn_gate_exps, 0, &gi, &go, &gr);
+        (void)tensor_expert_bytes(model, l->ffn_up_exps, 0, &ui, &uo, &ur);
+        (void)tensor_expert_bytes(model, l->ffn_down_exps, 0, &di, &dn, &dr);
+        ok = go != 0 && gr != 0 && dn != 0 && dr != 0 &&
+             ds4_gpu_glm_routed_moe_one_tensor(s->routed_out, s->routed_mid,
+                model->map, model->size,
+                l->ffn_gate_exps->abs_offset,
+                l->ffn_up_exps->abs_offset,
+                l->ffn_down_exps->abs_offset,
+                l->ffn_gate_exps->type,
+                l->ffn_up_exps->type,
+                l->ffn_down_exps->type,
+                go * gr, gr, uo * ur, ur, dn * dr, dr,
+                DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                s->router_selected, s->router_weights,
+                DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                il, s->ffn_norm, false) != 0;
+    }
+    if (ok) ok = ds4_gpu_add3_tensor(s->cur, s->after_attn,
+            s->routed_out, s->shared_out, DS4_N_EMBD) != 0;
+
+    /* draft output head */
+    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(s->out_norm, s->cur,
+            model->map, model->size, l->nextn_shared_head_norm->abs_offset,
+            DS4_N_EMBD, 1, DS4_RMS_EPS) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(s->logits, model->map,
+            model->size, weights->output->abs_offset,
+            DS4_N_EMBD, DS4_N_VOCAB, s->out_norm, 1) != 0;
+    if (ok) ok = ds4_gpu_tensor_read(s->logits, 0, logits_out,
+            (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    return ok;
+}
+
 static int generate_hy3_cuda_argmax(
         const ds4_model   * model,
         const ds4_vocab   * vocab,
@@ -35021,12 +35196,32 @@ static int generate_hy3_cuda_argmax(
     int n_generated = 0;
     uint32_t pos = (uint32_t)prompt->len;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
+    const bool mtp_probe = getenv("DS4_HY3_MTP_PROBE") != NULL;
+    float *draft_logits = mtp_probe ?
+            xmalloc((size_t)DS4_N_VOCAB * sizeof(float)) : NULL;
+    int mtp_pending = -1, mtp_pending2 = -1;
+    uint64_t mtp_total = 0, mtp_hit = 0, mtp_total2 = 0, mtp_hit2 = 0;
     const double t_decode0 = now_sec();
     for (int i = 0; i < n_predict && pos < s.ctx; i++) {
         const int token = sample_argmax(logits, DS4_N_VOCAB);
         if (vocab_token_is_generation_stop(vocab, token)) break;
         if (emit) emit(emit_ud, token);
         n_generated++;
+        if (mtp_probe) {
+            if (mtp_pending >= 0) {
+                mtp_total++;
+                if (token == mtp_pending) mtp_hit++;
+            }
+            if (mtp_pending2 >= 0) {
+                mtp_total2++;
+                if (token == mtp_pending2) mtp_hit2++;
+            }
+            mtp_pending2 = mtp_pending; /* same draft vs the token one later */
+            /* s.cur still holds the previous forward's final hidden */
+            mtp_pending = hy3_mtp_draft(&s, model, weights, token, pos,
+                                        draft_logits) ?
+                    sample_argmax(draft_logits, DS4_N_VOCAB) : -1;
+        }
         if (i == n_predict - 1 || pos + 1u >= s.ctx) {
             pos++;
             break;
@@ -35046,6 +35241,17 @@ static int generate_hy3_cuda_argmax(
         pos++;
     }
     const double t_decode1 = now_sec();
+    if (mtp_probe) {
+        fprintf(stderr,
+                "ds4: hy3 mtp probe: %llu/%llu d1 hits (%.1f%%), offset+2: %llu/%llu (%.1f%%)\n",
+                (unsigned long long)mtp_hit,
+                (unsigned long long)mtp_total,
+                mtp_total ? 100.0 * (double)mtp_hit / (double)mtp_total : 0.0,
+                (unsigned long long)mtp_hit2,
+                (unsigned long long)mtp_total2,
+                mtp_total2 ? 100.0 * (double)mtp_hit2 / (double)mtp_total2 : 0.0);
+        free(draft_logits);
+    }
     if (done) done(emit_ud);
     const double prefill_s = t_prefill1 - t_prefill0;
     const double decode_s = t_decode1 - t_decode0;
