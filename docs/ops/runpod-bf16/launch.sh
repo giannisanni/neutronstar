@@ -21,25 +21,18 @@ if ! curl -sL --max-time 30 "$RAW_URL" | diff -q - "$HERE/pod_job.sh" >/dev/null
 fi
 echo "job: $RAW_URL"
 
-echo "== 2. create 1.1TB network volume (>1TB tier = \$0.05/GB/mo) =="
-for DC in EU-RO-1 CA-MTL-1 EUR-IS-1 US-KS-2; do
-  R=$(rest POST networkvolumes "{\"name\":\"hy3-quant\",\"size\":1100,\"dataCenterId\":\"$DC\"}")
-  VOLID=$(echo "$R" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('id') or '')" 2>/dev/null)
-  [ -n "$VOLID" ] && { echo "volume $VOLID in $DC"; break; }
-  echo "  $DC: no ($(echo "$R" | head -c 120))"
-done
-[ -z "${VOLID:-}" ] && { echo "no volume created"; exit 1; }
-
-echo "== 3. create CPU pod (cpu3c, 16 vCPU / 32GB) =="
+# No network volume: RunPod requires a $5 minimum balance to create one, and
+# the job is self-contained anyway. A pod-local volume (dies with the pod, no
+# resume; worst case rerun ~$4) carries the 1.1TB working set instead.
+echo "== 2. create CPU pod (cpu3c, 16 vCPU / 32GB, 1.1TB local volume) =="
 runpodctl create pod \
   --computeType CPU --secureCloud \
   --name hy3-bf16-quant \
   --imageName python:3.11-bookworm \
   --vcpu 16 --mem 32 \
   --containerDiskSize 30 \
-  --networkVolumeId "$VOLID" --volumePath /vol \
-  --dataCenterId "$DC" \
-  --cost 0.60 \
+  --volumeSize 1100 --volumePath /vol \
+  --cost 0.80 \
   --env "HF_TOKEN=$HF_TOKEN" \
   --env "RUNPOD_API_KEY=$KEY" \
   --env "JOB_URL=$RAW_URL" \
@@ -48,11 +41,8 @@ runpodctl create pod \
 
 cat <<EOF
 
-Launched. The job self-terminates the pod when done (or on any failure).
+Launched. The job self-terminates the pod when done (or on any failure);
+the local volume dies with it, so nothing bills afterward.
 Watch:   runpodctl pod list
 Result:  https://huggingface.co/giannisan/Hy3-ds4-gguf  (file + build-log.txt)
-AFTER SUCCESS, delete the volume (it bills until deleted!):
-  curl -s -X DELETE "https://rest.runpod.io/v1/networkvolumes/$VOLID" \\
-    -H "Authorization: Bearer \$KEY"
-Also delete the gist: gh gist delete ${GIST_URL##*/}
 EOF
