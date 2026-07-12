@@ -5,8 +5,9 @@
 A fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) that runs
 frontier Mixture-of-Experts language models on a GPU that has no business
 running them: the routed experts are streamed from SSD on every token while
-attention and shared weights stay resident. Two models work end to end on one
-**RTX 4060 Ti 16GB** today:
+attention and shared weights stay resident. Three model families run through
+one engine, dispatched by the GGUF arch string; two are proven end to end on
+one **RTX 4060 Ti 16GB** today:
 
 - **GLM-5.2** (743B MoE): CUDA port of the whole GLM path, the SSD-streaming
   optimization stack, and the first MTP speculative-decoding implementation for
@@ -18,6 +19,9 @@ attention and shared weights stay resident. Two models work end to end on one
   retained across turns, and speculative cross-layer expert prefetch (the
   next layer's router runs early so the SSD reads its experts while the GPU
   is still on the current layer). ~2.1 tok/s on the same card.
+- **DeepSeek 4 / 4 Flash**: upstream ds4's original target, inherited intact
+  (MLA attention, DSA sparse indexer); the GLM CUDA work runs on the same
+  MLA plumbing.
 
 Reference machine: RTX 4060 Ti 16GB, 32GB DDR5, Ryzen 9900X, one NVMe. The GLM
 campaign arc was 0.05 → 0.40 t/s generation and 0.30 → 6.5 t/s prefill on
