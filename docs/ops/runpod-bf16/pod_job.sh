@@ -38,14 +38,33 @@ pip install -q --no-cache-dir torch --index-url https://download.pytorch.org/whl
 pip install -q --no-cache-dir gguf safetensors "transformers>=4.45" sentencepiece pyyaml || die "pip deps"
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
+# Resume support: a balance-stop keeps /vol but restarts this script from
+# scratch. Detect completed phases by their volume artifacts. The q8_0
+# intermediate counts as complete only when its header parses AND it is
+# past the truncation floor (convert writes it incrementally).
+Q8="$VOL/hy3-q8_0.gguf"
+q8_complete() {
+  [ -f "$Q8" ] || return 1
+  [ "$(stat -c%s "$Q8" 2>/dev/null || echo 0)" -gt 300000000000 ] || return 1
+  python - "$Q8" <<'PY' >/dev/null 2>&1
+import sys
+from gguf import GGUFReader
+GGUFReader(sys.argv[1])
+PY
+}
+
 mark "PHASE 1: network speed gate"
-# pull 1GB of a known-fast HF file; require >=80MB/s or bail out cheap
-T0=$(date +%s)
-curl -sL --max-time 120 -r 0-1073741823 -o /dev/null \
-  "https://huggingface.co/tencent/Hy3/resolve/main/model-00001-of-00099.safetensors" || die "speed test fetch"
-T1=$(date +%s); MBPS=$(( 1024 / (T1 - T0 + 1) ))
-echo "network: ~${MBPS} MB/s" | tee -a "$LOG"
-[ "$MBPS" -lt 45 ] && die "network too slow (${MBPS} MB/s), aborting to save credit"
+if [ -f "$Q8" ] || [ -d "$VOL/bf16" ]; then
+  echo "resume detected: volume has prior progress, skipping speed gate" | tee -a "$LOG"
+else
+  # pull 1GB of a known-fast HF file; require >=45MB/s or bail out cheap
+  T0=$(date +%s)
+  curl -sL --max-time 120 -r 0-1073741823 -o /dev/null \
+    "https://huggingface.co/tencent/Hy3/resolve/main/model-00001-of-00099.safetensors" || die "speed test fetch"
+  T1=$(date +%s); MBPS=$(( 1024 / (T1 - T0 + 1) ))
+  echo "network: ~${MBPS} MB/s" | tee -a "$LOG"
+  [ "$MBPS" -lt 45 ] && die "network too slow (${MBPS} MB/s), aborting to save credit"
+fi
 
 mark "PHASE 2: llama.cpp (PR 25395, arch string patched to hy-v3)"
 cd /root
@@ -62,17 +81,41 @@ cmake -B build -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OF
 cmake --build build --target llama-quantize -j"$(nproc)" >/dev/null 2>&1 || die "build quantize"
 
 mark "PHASE 3: download BF16 (598GB) + imatrix"
-hf download tencent/Hy3 --local-dir "$VOL/bf16" >>"$LOG" 2>&1 || die "bf16 download"
+if q8_complete; then
+  echo "resume: q8_0 intermediate complete, skipping bf16 download" | tee -a "$LOG"
+  rm -rf "$VOL/bf16"
+else
+  # hf download resumes: existing complete files are skipped
+  hf download tencent/Hy3 --local-dir "$VOL/bf16" >>"$LOG" 2>&1 || die "bf16 download"
+fi
 hf download YanissAmz/Hy3-295B-A21B-GGUF Hy3.imatrix.gguf --local-dir "$VOL" >>"$LOG" 2>&1 || die "imatrix download"
 df -h "$VOL" | tee -a "$LOG"
 
 mark "PHASE 4: convert BF16 -> Q8_0 GGUF"
-python convert_hf_to_gguf.py "$VOL/bf16" --outtype q8_0 \
-  --outfile "$VOL/hy3-q8_0.gguf" >>"$LOG" 2>&1 || die "convert"
+if q8_complete; then
+  echo "resume: skipping convert" | tee -a "$LOG"
+else
+  rm -f "$Q8"
+  python convert_hf_to_gguf.py "$VOL/bf16" --outtype q8_0 \
+    --outfile "$Q8" >>"$LOG" 2>&1 || die "convert"
+fi
 rm -rf "$VOL/bf16"
 df -h "$VOL" | tee -a "$LOG"
 
 mark "PHASE 5: quantize to ds4 recipe (uniform IQ2_XXS experts, $RES_T rest, recipe=$RECIPE)"
+out_complete() {
+  [ -f "$VOL/$OUTFILE" ] || return 1
+  [ "$(stat -c%s "$VOL/$OUTFILE" 2>/dev/null || echo 0)" -gt 70000000000 ] || return 1
+  python - "$VOL/$OUTFILE" <<'PY' >/dev/null 2>&1
+import sys
+from gguf import GGUFReader
+GGUFReader(sys.argv[1])
+PY
+}
+if out_complete; then
+  echo "resume: quantized output present, skipping quantize" | tee -a "$LOG"
+else
+rm -f "$VOL/$OUTFILE"
 # NOTE: --tensor-type is unanchored regex_search; keep patterns anchored.
 # NOTE: NO pipes on this command (head/grep SIGPIPE killed earlier runs).
 ./build/bin/llama-quantize --allow-requantize --imatrix "$VOL/Hy3.imatrix.gguf" \
@@ -83,8 +126,9 @@ mark "PHASE 5: quantize to ds4 recipe (uniform IQ2_XXS experts, $RES_T rest, rec
   --tensor-type "ffn_(gate|up|down)_shexp\\.weight=$RES_T" \
   --tensor-type "blk\\.0\\.ffn_(gate|up|down)\\.weight=$RES_T" \
   --token-embedding-type "$RES_T" --output-tensor-type "$OUT_T" \
-  "$VOL/hy3-q8_0.gguf" "$VOL/$OUTFILE" iq2_xxs "$(nproc)" \
+  "$Q8" "$VOL/$OUTFILE" iq2_xxs "$(nproc)" \
   >>"$LOG" 2>&1 || die "quantize"
+fi
 
 mark "PHASE 6: verify output header"
 EXPECT_EMBD="$EXPECT_EMBD" python - "$VOL/$OUTFILE" <<'PY' >>"$LOG" 2>&1 || die "header verify"
