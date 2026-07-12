@@ -222,7 +222,7 @@ def draw_text(base):
 
     # --- Tagline, top-right, small-caps sans, letter-spaced, 3 lines ---
     tag = load_font(HELVN, 16, index=10)  # medium, roman
-    lines = ["RUN 295B MODELS", "ON A 16GB GPU", "EXPERTS STREAMED FROM DISK"]
+    lines = ["GIANT MODELS", "ON MODEST HARDWARE", "EXPERTS STREAMED FROM DISK"]
     ty = 72
     for ln in lines:
         spaced = spaced_text(ln, 3)
@@ -230,23 +230,10 @@ def draw_text(base):
         d.text((W - 64 - w, ty), spaced, font=tag, fill=(184, 190, 208))
         ty += 27
 
-    # --- Rotated date/label on left edge, middle ---
-    edge = load_font(HELVN, 14, index=10)
-    label = spaced_text("EST. 2026  —  FORK OF DS4", 2)
-    tw = int(d.textlength(label, font=edge))
-    strip = Image.new("RGBA", (tw + 10, 22), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(strip)
-    sd.text((0, 2), label, font=edge, fill=(120, 126, 150))
-    strip = strip.rotate(90, expand=True)
-    base.paste(strip, (26, CY - strip.height // 2 - 40), strip)
-
     # --- Bottom-left caption block ---
     cap_big = load_font(HELVN, 22, index=1)   # bold, roman
-    cap_small = load_font(HELVN, 15, index=10)  # medium, roman
     d.text((66, H - 96), spaced_text("SSD EXPERT STREAMING", 2),
            font=cap_big, fill=(224, 228, 240))
-    d.text((66, H - 62), spaced_text("CUDA  ·  IQ2_XXS  ·  2.08 TOK/S", 2),
-           font=cap_small, fill=(120, 126, 150))
 
 
 def spaced_text(s, n):
