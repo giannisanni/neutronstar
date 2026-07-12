@@ -13,10 +13,13 @@ rest() { curl -s --max-time 30 -X "$1" "https://rest.runpod.io/v1/$2" \
          -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
          ${3:+-d "$3"}; }
 
-echo "== 1. host the job script as a secret gist (no secrets inside it) =="
-GIST_URL=$(gh gist create --secret "$HERE/pod_job.sh" 2>/dev/null | tail -1)
-RAW_URL="${GIST_URL/gist.github.com/gist.githubusercontent.com}/raw/pod_job.sh"
-echo "gist: $GIST_URL"
+echo "== 1. job script: fetched from the public repo (committed + pushed) =="
+RAW_URL="https://raw.githubusercontent.com/giannisanni/neutronstar/hy3/docs/ops/runpod-bf16/pod_job.sh"
+# refuse to launch if the local script differs from what the pod will fetch
+if ! curl -sL --max-time 30 "$RAW_URL" | diff -q - "$HERE/pod_job.sh" >/dev/null; then
+  echo "local pod_job.sh differs from $RAW_URL; commit + push first"; exit 1
+fi
+echo "job: $RAW_URL"
 
 echo "== 2. create 1.1TB network volume (>1TB tier = \$0.05/GB/mo) =="
 for DC in EU-RO-1 CA-MTL-1 EUR-IS-1 US-KS-2; do
